@@ -351,7 +351,7 @@ function AppContent() {
       <Route path="/login" element={<LoginPage initialView="login" />} />
       <Route path="/register" element={<LoginPage initialView="register" />} />
       <Route path="/forgot-password" element={<LoginPage initialView="login" />} />
-      <Route path="/otp-verification" element={<LoginPage initialView="register" />} />
+      <Route path="/otp-verification" element={<Navigate to="/register" replace />} />
 
       {/* PROTECTED ROUTES (All require active authentication) */}
       <Route 

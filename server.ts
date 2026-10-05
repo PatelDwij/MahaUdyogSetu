@@ -216,71 +216,7 @@ const otpStore = new Map<string, { otp: string; expiresAt: number; profile: any 
 // In-memory Registered Companies Store for instant verification and testing
 export const registeredCompaniesMap = new Map<string, any>();
 
-// =========================================================================
-// SERVER-SIDE CRYPTOGRAPHIC CAPTCHA ENGINE & STORAGE
-// =========================================================================
-interface CaptchaRecord {
-  code: string;
-  expiresAt: number;
-}
-export const captchaStore = new Map<string, CaptchaRecord>();
 
-// Clean up expired captchas periodically (every 5 minutes)
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, record] of captchaStore.entries()) {
-    if (now > record.expiresAt) {
-      captchaStore.delete(id);
-    }
-  }
-}, 5 * 60 * 1000);
-
-/**
- * Generate a cryptographically secure, visually distorted government-style SVG CAPTCHA
- */
-export function generateCaptchaSvg(code: string): string {
-  const width = 160;
-  const height = 48;
-  const colors = ["#b91c1c", "#1d4ed8", "#6d28d9", "#047857", "#b45309", "#be185d", "#0e7490"];
-  
-  let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`;
-  svg += `<rect width="100%" height="100%" fill="#f8fafc" rx="8" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="3 3"/>`;
-  
-  // Background Noise Dots
-  for (let i = 0; i < 40; i++) {
-    const cx = Math.floor(Math.random() * width);
-    const cy = Math.floor(Math.random() * height);
-    const r = (Math.random() * 1.5 + 0.5).toFixed(1);
-    const color = colors[Math.floor(Math.random() * colors.length)];
-    svg += `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${color}" opacity="0.35"/>`;
-  }
-  
-  // Noise Lines
-  for (let i = 0; i < 3; i++) {
-    const x1 = Math.floor(Math.random() * 20);
-    const y1 = Math.floor(Math.random() * height);
-    const x2 = Math.floor(width - Math.random() * 20);
-    const y2 = Math.floor(Math.random() * height);
-    const color = colors[Math.floor(Math.random() * colors.length)];
-    svg += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="1.2" opacity="0.4"/>`;
-  }
-  
-  // Distorted Characters with rotations, font variations, and colors
-  const charSpacing = (width - 32) / code.length;
-  for (let i = 0; i < code.length; i++) {
-    const char = code[i];
-    const x = 18 + i * charSpacing + (Math.random() * 4 - 2);
-    const y = 33 + (Math.random() * 6 - 3);
-    const angle = Math.floor(Math.random() * 26 - 13);
-    const color = colors[i % colors.length];
-    const fontSize = 23 + Math.floor(Math.random() * 5);
-    
-    svg += `<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" fill="${color}" font-family="monospace, Courier, sans-serif" font-size="${fontSize}" font-weight="900" transform="rotate(${angle}, ${x.toFixed(1)}, ${y.toFixed(1)})">${char}</text>`;
-  }
-  
-  svg += `</svg>`;
-  return svg;
-}
 
 // Default benchmark company ID
 const DEFAULT_COMPANY_ID = "BIZ-MH-FGHIJ-001";
@@ -1554,64 +1490,7 @@ app.get("/api/health", async (_req, res) => {
   });
 });
 
-// 1.5. GET /api/auth/captcha - Generate cryptographic visual CAPTCHA with SVG image
-app.get("/api/auth/captcha", (req, res) => {
-  try {
-    const chars = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
-    let code = "";
-    for (let i = 0; i < 5; i++) {
-      code += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
 
-    const captchaId = crypto.randomUUID();
-    const svg = generateCaptchaSvg(code);
-    const dataUrl = `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
-
-    // Store in captchaStore with 5-minute validity
-    captchaStore.set(captchaId, {
-      code: code.toUpperCase(),
-      expiresAt: Date.now() + 5 * 60 * 1000
-    });
-
-    res.json({
-      success: true,
-      captchaId,
-      image: dataUrl,
-      expiresInSeconds: 300
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: "Failed to generate security CAPTCHA." });
-  }
-});
-
-// 1.6. POST /api/auth/verify-captcha - Standalone CAPTCHA verification
-app.post("/api/auth/verify-captcha", (req, res) => {
-  try {
-    const { captchaId, captchaInput } = req.body;
-    if (!captchaId || !captchaInput) {
-      return res.status(400).json({ error: "Captcha ID and characters are required." });
-    }
-
-    const record = captchaStore.get(captchaId);
-    if (!record) {
-      return res.status(400).json({ error: "Captcha has expired. Please refresh the captcha." });
-    }
-
-    captchaStore.delete(captchaId); // Burn immediately
-
-    if (Date.now() > record.expiresAt) {
-      return res.status(400).json({ error: "Captcha has expired. Please refresh the captcha." });
-    }
-
-    if (record.code !== captchaInput.trim().toUpperCase()) {
-      return res.status(400).json({ error: "Invalid Captcha code. Please enter the characters shown." });
-    }
-
-    res.json({ success: true, message: "Captcha verified successfully." });
-  } catch (err: any) {
-    res.status(500).json({ error: "Captcha verification failed." });
-  }
-});
 
 // 2. Send Registration OTP via Twilio SMS (or simulated carrier) - Relaxed for multi-device testing
 app.post("/api/auth/send-otp", createRateLimiter({ windowMs: 60 * 1000, max: 100, message: "Too many OTP requests. Please wait 1 minute." }), async (req, res) => {
@@ -1688,150 +1567,164 @@ app.post("/api/auth/send-otp", createRateLimiter({ windowMs: 60 * 1000, max: 100
   }
 });
 
-// 3. Verify OTP & Activate Registration -> Persists Company to Supabase
+/**
+ * Helper to register an enterprise account in Supabase & memory cache with secure password hashing
+ */
+async function registerEnterpriseAccount(data: any) {
+  const pan = (data.pan || "").toUpperCase().trim();
+  const cin = (data.cin || "").toUpperCase().trim();
+  const gstin = (data.gstin || "").toUpperCase().trim();
+  const email = (data.email || "").toLowerCase().trim();
+  const cleanMobile = (data.mobile || "").replace(/\D/g, "").slice(-10);
+
+  const companyName = data.companyName || data.name || "Registered Enterprise";
+  const userPassword = data.password || "Password@123";
+  if (userPassword.length < 6) {
+    throw new Error("Password must be at least 6 characters long.");
+  }
+
+  // Check if company already exists by PAN / CIN / GSTIN
+  let existingCompany: any = null;
+  if (pan) {
+    const { data: byPan } = await supabase.from("companies").select("*").eq("pan", pan).maybeSingle();
+    if (byPan) existingCompany = byPan;
+  }
+  if (!existingCompany && cin) {
+    const { data: byCin } = await supabase.from("companies").select("*").eq("cin", cin).maybeSingle();
+    if (byCin) existingCompany = byCin;
+  }
+  if (!existingCompany && gstin) {
+    const { data: byGstin } = await supabase.from("companies").select("*").eq("gstin", gstin).maybeSingle();
+    if (byGstin) existingCompany = byGstin;
+  }
+
+  const companyId = existingCompany?.id || data.companyId || data.id || `BIZ-MH-${pan ? pan.slice(0, 5) : 'ENT'}-${Math.floor(100 + Math.random() * 900)}`;
+  const passwordHash = hashPassword(userPassword);
+
+  const isComplete = Boolean(
+    data.sector && 
+    (data.investmentCrores || data.investment_crores) && 
+    (data.connectedPowerKw || data.connected_power_kw) && 
+    data.workforce
+  );
+
+  const companyDbRecord = {
+    id: companyId,
+    name: companyName,
+    business_type: data.businessType || "Private Limited",
+    cin: cin || null,
+    pan: pan || "ABCDE1234F",
+    gstin: gstin || "27ABCDE1234F1Z5",
+    mobile: cleanMobile,
+    email: email,
+    password_hash: passwordHash,
+    state: data.state || "Maharashtra",
+    district: data.district || "Nashik",
+    taluka: data.taluka || "Ambad",
+    address: data.address || "MIDC Industrial Area, Maharashtra",
+    sector: data.sector || "Engineering & Heavy Manufacturing",
+    scale: data.scale || (Number(data.investmentCrores) > 50 ? "Large" : (Number(data.investmentCrores) > 10 ? "Medium" : "Small")),
+    investment_crores: Number(data.investmentCrores || data.investment_crores) || 10.0,
+    workforce: Number(data.workforce) || 50,
+    connected_power_kw: Number(data.powerKw || data.connectedPowerKw || data.connected_power_kw) || 150,
+    handles_hazardous: Boolean(data.handlesHazardous || data.handles_hazardous),
+    land_type: data.landType || data.land_type || "Industrial Park (Allotted)",
+    stage: data.stage || "Pre-Establishment",
+    is_profile_complete: isComplete,
+    updated_at: new Date().toISOString()
+  };
+
+  // Upsert into Supabase public.companies
+  const { data: savedData, error: dbError } = await supabase
+    .from("companies")
+    .upsert(companyDbRecord)
+    .select()
+    .single();
+
+  if (dbError) {
+    console.warn("Supabase upsert note during registration:", dbError.message);
+  }
+
+  // Store in in-memory cache for immediate authentication verification
+  if (cleanMobile) registeredCompaniesMap.set(cleanMobile, companyDbRecord);
+  if (email) registeredCompaniesMap.set(email.toLowerCase(), companyDbRecord);
+  if (cin) registeredCompaniesMap.set(cin.toUpperCase(), companyDbRecord);
+
+  const finalProfile = dbToBusinessProfile(savedData || companyDbRecord);
+  const token = generateSessionToken(companyId, finalProfile.email);
+
+  return {
+    token,
+    companyId,
+    profile: finalProfile
+  };
+}
+
+// 2. Direct Enterprise Registration (Secure Password-Based)
+app.post("/api/auth/register", createRateLimiter({ windowMs: 60 * 1000, max: 100, message: "Too many registration attempts. Please wait 1 minute." }), async (req, res) => {
+  try {
+    const { companyName, email, mobile, password } = req.body;
+    if (!companyName && !req.body.name) {
+      return res.status(400).json({ error: "Enterprise / Company name is required." });
+    }
+    if (!email && !mobile) {
+      return res.status(400).json({ error: "Email address or mobile number is required." });
+    }
+    if (password && password.length < 6) {
+      return res.status(400).json({ error: "Password must be at least 6 characters long." });
+    }
+
+    const result = await registerEnterpriseAccount(req.body);
+    res.json({
+      success: true,
+      message: "Enterprise profile registered successfully.",
+      token: result.token,
+      companyId: result.companyId,
+      profile: result.profile
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "Registration failed" });
+  }
+});
+
+// 3. Verify OTP / Registration Fallback (Persists Company to Supabase)
 app.post("/api/auth/verify-otp", createRateLimiter({ windowMs: 60 * 1000, max: 100, message: "Too many verification attempts. Please wait 1 minute." }), async (req, res) => {
   try {
     const { mobile, otp, profile } = req.body;
     const cleanMobile = (mobile || "").replace(/\D/g, "").slice(-10);
 
     const storedRecord = otpStore.get(cleanMobile);
-
-    // Testing mode: Allow ANY entered OTP so the user is never blocked by physical SMS delivery
     const enteredOtp = (otp || "").trim();
     if (!enteredOtp) {
       return res.status(400).json({ error: "Please enter any OTP code to proceed." });
     }
 
     const fullProfileData = profile || storedRecord?.profile || {};
-    const pan = (fullProfileData.pan || "").toUpperCase().trim();
-    const cin = (fullProfileData.cin || "").toUpperCase().trim();
-    const gstin = (fullProfileData.gstin || "").toUpperCase().trim();
-    const email = (fullProfileData.email || "").toLowerCase().trim();
-
-    const userPassword = fullProfileData.password || "Password@123";
-    if (userPassword.length < 6) {
-      return res.status(400).json({ error: "Password must be at least 6 characters long." });
+    if (cleanMobile && !fullProfileData.mobile) {
+      fullProfileData.mobile = cleanMobile;
     }
 
-    // Check if company already exists by PAN / CIN / GSTIN
-    let existingCompany = null;
-    if (pan) {
-      const { data } = await supabase.from("companies").select("*").eq("pan", pan).maybeSingle();
-      if (data) existingCompany = data;
-    }
-    if (!existingCompany && cin) {
-      const { data } = await supabase.from("companies").select("*").eq("cin", cin).maybeSingle();
-      if (data) existingCompany = data;
-    }
-    if (!existingCompany && gstin) {
-      const { data } = await supabase.from("companies").select("*").eq("gstin", gstin).maybeSingle();
-      if (data) existingCompany = data;
-    }
-
-    const companyId = existingCompany?.id || fullProfileData.id || `BIZ-MH-${pan ? pan.slice(0, 5) : 'ENT'}-${Math.floor(100 + Math.random() * 900)}`;
-    const passwordHash = hashPassword(userPassword);
-
-    const isComplete = Boolean(
-      fullProfileData.sector && 
-      (fullProfileData.investmentCrores || fullProfileData.investment_crores) && 
-      (fullProfileData.connectedPowerKw || fullProfileData.connected_power_kw) && 
-      fullProfileData.workforce
-    );
-
-    const companyDbRecord = {
-      id: companyId,
-      name: fullProfileData.companyName || fullProfileData.name || "Registered Enterprise",
-      business_type: fullProfileData.businessType || "Private Limited",
-      cin: cin || null,
-      pan: pan || "ABCDE1234F",
-      gstin: gstin || "27ABCDE1234F1Z5",
-      mobile: cleanMobile,
-      email: email,
-      password_hash: passwordHash,
-      state: fullProfileData.state || "Maharashtra",
-      district: fullProfileData.district || "Nashik",
-      taluka: fullProfileData.taluka || "Ambad",
-      address: fullProfileData.address || "MIDC Industrial Area, Maharashtra",
-      sector: fullProfileData.sector || "Engineering & Heavy Manufacturing",
-      scale: fullProfileData.scale || (Number(fullProfileData.investmentCrores) > 50 ? "Large" : (Number(fullProfileData.investmentCrores) > 10 ? "Medium" : "Small")),
-      investment_crores: Number(fullProfileData.investmentCrores || fullProfileData.investment_crores) || 10.0,
-      workforce: Number(fullProfileData.workforce) || 50,
-      connected_power_kw: Number(fullProfileData.powerKw || fullProfileData.connectedPowerKw || fullProfileData.connected_power_kw) || 150,
-      handles_hazardous: Boolean(fullProfileData.handlesHazardous || fullProfileData.handles_hazardous),
-      land_type: fullProfileData.landType || fullProfileData.land_type || "Industrial Park (Allotted)",
-      stage: fullProfileData.stage || "Pre-Establishment",
-      is_profile_complete: isComplete,
-      updated_at: new Date().toISOString()
-    };
-
-    // Upsert into Supabase public.companies
-    const { data: savedData, error: dbError } = await supabase
-      .from("companies")
-      .upsert(companyDbRecord)
-      .select()
-      .single();
-
-    if (dbError) {
-      console.warn("Supabase upsert note during registration:", dbError.message);
-    }
-
+    const result = await registerEnterpriseAccount(fullProfileData);
     otpStore.delete(cleanMobile);
-
-    // Store in in-memory cache for immediate authentication verification
-    registeredCompaniesMap.set(cleanMobile, companyDbRecord);
-    if (email) registeredCompaniesMap.set(email.toLowerCase(), companyDbRecord);
-    if (cin) registeredCompaniesMap.set(cin.toUpperCase(), companyDbRecord);
-
-    const finalProfile = dbToBusinessProfile(savedData || companyDbRecord);
-    const token = generateSessionToken(companyId, finalProfile.email);
 
     res.json({
       success: true,
       message: "Authentication verified and enterprise profile registered successfully.",
-      token,
-      companyId,
-      profile: finalProfile
+      token: result.token,
+      companyId: result.companyId,
+      profile: result.profile
     });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || "Verification failed" });
   }
 });
 
-// 4. Authentication & Company Login (Verifies Captcha + Credentials + Scrypt Hash)
+// 4. Authentication & Company Login (Verifies Credentials + Scrypt Hash)
 app.post("/api/auth/login", createRateLimiter({ windowMs: 60 * 1000, max: 100, message: "Too many login attempts. Please wait 1 minute." }), async (req, res) => {
   try {
-    const { companyName, cin, mobile, email, password, captchaId, captchaInput } = req.body;
+    const { companyName, cin, mobile, email, password } = req.body;
 
-    // A. Enforce Server-Side Captcha Verification
-    if (!captchaId || !captchaInput || !captchaInput.trim()) {
-      return res.status(400).json({
-        error: "Captcha verification is required. Please enter the characters shown in the security image."
-      });
-    }
-
-    const storedCaptcha = captchaStore.get(captchaId);
-    if (!storedCaptcha) {
-      return res.status(400).json({
-        error: "Captcha code has expired. Please click the refresh button for a new captcha."
-      });
-    }
-
-    // Always delete captcha on first attempt (single-use to prevent replay attacks)
-    captchaStore.delete(captchaId);
-
-    if (Date.now() > storedCaptcha.expiresAt) {
-      return res.status(400).json({
-        error: "Captcha code has expired. Please click the refresh button for a new captcha."
-      });
-    }
-
-    if (storedCaptcha.code !== captchaInput.trim().toUpperCase()) {
-      return res.status(400).json({
-        error: "Invalid Captcha code entered. Please type the characters shown in the image."
-      });
-    }
-
-    // B. Validate Login Credentials
+    // Validate Login Credentials
     const rawIdentifier = (email || mobile || cin || companyName || "").trim();
     if (!rawIdentifier) {
       return res.status(400).json({ error: "Please enter your registered email, mobile, or CIN." });

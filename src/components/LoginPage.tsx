@@ -24,7 +24,6 @@ import {
   ChevronRight, 
   UserPlus, 
   LogIn, 
-  RotateCcw, 
   BookOpen, 
   ArrowLeft,
   ShieldAlert
@@ -55,36 +54,9 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
   const [viewMode, setViewMode] = useState<'home' | 'login' | 'register'>(initialView || 'home');
   const [postAuthRedirect, setPostAuthRedirect] = useState<string | undefined>(undefined);
   
-  // Registration 3-Step Wizard state
-  const [regStep, setRegStep] = useState<1 | 2 | 3>(1);
+  // Registration 2-Step Wizard state
+  const [regStep, setRegStep] = useState<1 | 2>(1);
   const [entityType, setEntityType] = useState<'indian' | 'foreign'>('indian');
-
-  // Real Server-Side Cryptographic Captcha State
-  const [captchaId, setCaptchaId] = useState<string>('');
-  const [captchaImage, setCaptchaImage] = useState<string>('');
-  const [captchaInput, setCaptchaInput] = useState<string>('');
-  const [isCaptchaLoading, setIsCaptchaLoading] = useState<boolean>(false);
-
-  const fetchServerCaptcha = async () => {
-    setIsCaptchaLoading(true);
-    try {
-      const res = await fetch('/api/auth/captcha');
-      const data = await res.json();
-      if (data.success && data.captchaId && data.image) {
-        setCaptchaId(data.captchaId);
-        setCaptchaImage(data.image);
-        setCaptchaInput('');
-      }
-    } catch (err) {
-      console.error('Failed to load server captcha:', err);
-    } finally {
-      setIsCaptchaLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchServerCaptcha();
-  }, []);
 
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -139,8 +111,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
   // Login Form State - Starts completely empty (no default test credentials)
   const [loginForm, setLoginForm] = useState({
     email: '',
-    password: '',
-    captcha: ''
+    password: ''
   });
 
   // Registration Form State - Starts completely empty for user testing
@@ -152,8 +123,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
     gstin: '',
     email: '',
     mobile: '',
-    emailOtp: '',
-    mobileOtp: '',
     password: '',
     confirmPassword: '',
     state: 'Maharashtra',
@@ -167,8 +136,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
     handlesHazardous: false
   });
 
-  // Handle Step 2 -> Step 3 (Send OTP to mobile via SMS / Twilio Gateway)
-  const handleSendOtpStep2 = async (e: React.FormEvent) => {
+  // Handle Step 2 (Register Account Directly with Password Authentication)
+  const handleRegisterSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!regForm.companyName || !regForm.companyName.trim()) {
       setStatusMessage({ type: 'error', text: 'Please enter your Enterprise / Company Name in Step 1.' });
@@ -180,8 +149,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
       setStatusMessage({ type: 'error', text: 'Please enter a valid email address and 10-digit mobile number.' });
       return;
     }
-    if (!regForm.password || regForm.password.length < 8) {
-      setStatusMessage({ type: 'error', text: 'Password must be at least 8 characters long.' });
+    if (!regForm.password || regForm.password.length < 6) {
+      setStatusMessage({ type: 'error', text: 'Password must be at least 6 characters long.' });
       return;
     }
     if (regForm.password !== regForm.confirmPassword) {
@@ -192,87 +161,38 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
     setStatusMessage(null);
 
     try {
-      const res = await fetch('/api/auth/send-otp', {
+      const res = await fetch('/api/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          companyName: regForm.companyName.trim(),
+          businessType: regForm.businessType,
+          cin: regForm.cin.trim(),
+          pan: regForm.pan.trim(),
+          gstin: regForm.gstin.trim(),
+          email: regForm.email.trim(),
           mobile: cleanMobile,
-          email: regForm.email,
-          companyName: regForm.companyName
-        }),
-      });
-      const data = await res.json();
-      
-      if (!res.ok || data.error) {
-        setIsLoading(false);
-        setStatusMessage({
-          type: 'error',
-          text: data.error || 'Failed to dispatch verification OTP. Please try again.'
-        });
-        return;
-      }
-
-      setIsLoading(false);
-      setRegStep(3);
-
-      // Inform user that OTP was dispatched to their mobile phone and testing mode allows any code
-      setStatusMessage({
-        type: 'success',
-        text: `Verification OTP dispatched to +91 ${cleanMobile}. (Testing mode: you can enter any code, e.g. 123456, to proceed)`
-      });
-    } catch (err: any) {
-      setIsLoading(false);
-      setStatusMessage({
-        type: 'error',
-        text: err?.message || 'Network error while requesting verification OTP.'
-      });
-    }
-  };
-
-  // Handle Step 3 (Verify OTP & Complete Registration)
-  const handleVerifyOtpStep3 = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const enteredOtp = (regForm.mobileOtp || regForm.emailOtp || '123456').trim();
-    setIsLoading(true);
-    setStatusMessage(null);
-
-    try {
-      const res = await fetch('/api/auth/verify-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          mobile: regForm.mobile,
-          otp: enteredOtp,
-          profile: {
-            companyName: regForm.companyName,
-            businessType: regForm.businessType,
-            cin: regForm.cin,
-            pan: regForm.pan,
-            gstin: regForm.gstin,
-            email: regForm.email,
-            mobile: regForm.mobile,
-            password: regForm.password || 'Password@123',
-            state: regForm.state,
-            district: regForm.district,
-            address: regForm.address,
-            sector: regForm.sector,
-            investmentCrores: regForm.investmentCrores,
-            workforce: regForm.workforce,
-            powerKw: regForm.powerKw,
-            landType: regForm.landType,
-            handlesHazardous: regForm.handlesHazardous
-          }
+          password: regForm.password,
+          state: regForm.state,
+          district: regForm.district,
+          address: regForm.address,
+          sector: regForm.sector,
+          investmentCrores: regForm.investmentCrores,
+          workforce: regForm.workforce,
+          powerKw: regForm.powerKw,
+          landType: regForm.landType,
+          handlesHazardous: regForm.handlesHazardous
         }),
       });
       const data = await res.json();
 
       if (!res.ok || data.error) {
-        throw new Error(data.error || 'Verification failed. Please check the OTP.');
+        throw new Error(data.error || 'Registration failed. Please check the details provided.');
       }
 
       setIsLoading(false);
 
-      // Automatically log the user in immediately!
+      // Automatically log the user in immediately if token and profile returned
       if (data.token && data.profile) {
         login(data.profile, data.token, postAuthRedirect);
         if (onLoginSuccess) {
@@ -287,43 +207,34 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
         return;
       }
 
-      // Pre-fill registered email for convenience, but keep password completely blank
       setLoginForm({
         email: regForm.email,
-        password: '',
-        captcha: ''
+        password: ''
       });
-
-      // Switch view to Login screen
       setViewMode('login');
       setRegStep(1);
-      fetchServerCaptcha();
       setStatusMessage({
         type: 'success',
-        text: 'Registration verified successfully! Please enter your password and security captcha to login.'
+        text: 'Registration completed successfully! Please login with your password.'
       });
     } catch (err: any) {
       setIsLoading(false);
       setStatusMessage({
         type: 'error',
-        text: err.message || 'Verification failed. Please try again.'
+        text: err.message || 'Registration failed. Please try again.'
       });
     }
   };
 
-  // Handle Login Submission with Server Captcha Validation
+  // Handle Login Submission with Secure Password Authentication
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!loginForm.email) {
-      setStatusMessage({ type: 'error', text: 'Please enter your registered email address.' });
+    if (!loginForm.email.trim()) {
+      setStatusMessage({ type: 'error', text: 'Please enter your registered email address, mobile number, or CIN.' });
       return;
     }
     if (!loginForm.password) {
       setStatusMessage({ type: 'error', text: 'Please enter your password.' });
-      return;
-    }
-    if (!captchaInput.trim()) {
-      setStatusMessage({ type: 'error', text: 'Please enter the characters shown in the security captcha.' });
       return;
     }
 
@@ -336,15 +247,12 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email: loginForm.email.trim(),
-          password: loginForm.password,
-          captchaId,
-          captchaInput: captchaInput.trim()
+          password: loginForm.password
         }),
       });
       const data = await res.json();
 
       if (!res.ok || data.error) {
-        fetchServerCaptcha(); // Refresh captcha after any failed attempt
         throw new Error(data.error || 'Authentication failed. Please verify your credentials.');
       }
 
@@ -632,48 +540,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
                 </div>
               </div>
 
-              {/* Real Server Captcha Box */}
-              <div className="space-y-1.5 pt-1">
-                <div className="flex items-center gap-2">
-                  {/* Real Server SVG Captcha Image */}
-                  <div className="h-12 w-44 rounded-lg border border-slate-300 bg-slate-50 flex items-center justify-center overflow-hidden shadow-2xs">
-                    {captchaImage ? (
-                      <img 
-                        src={captchaImage} 
-                        alt="Security Captcha" 
-                        className="h-full w-full object-cover select-none pointer-events-none"
-                      />
-                    ) : (
-                      <div className="text-[11px] text-slate-400 flex items-center gap-1 font-mono">
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-blue-600" />
-                        Loading...
-                      </div>
-                    )}
-                  </div>
 
-                  {/* Refresh Captcha Button */}
-                  <button
-                    type="button"
-                    onClick={fetchServerCaptcha}
-                    disabled={isCaptchaLoading}
-                    className="w-10 h-10 rounded-lg bg-blue-600 hover:bg-blue-700 active:scale-95 text-white flex items-center justify-center transition-all cursor-pointer shadow-xs disabled:opacity-50"
-                    title={t('login.refreshCaptcha', 'Reload Captcha')}
-                  >
-                    <RotateCcw className={`w-4 h-4 ${isCaptchaLoading ? 'animate-spin' : ''}`} />
-                  </button>
-                </div>
-
-                <input
-                  type="text"
-                  required
-                  autoComplete="off"
-                  maxLength={6}
-                  placeholder={t('login.enterCaptcha', 'Enter captcha characters')}
-                  value={captchaInput}
-                  onChange={(e) => setCaptchaInput(e.target.value.toUpperCase())}
-                  className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 bg-white text-slate-900 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono font-bold tracking-wider uppercase mt-1"
-                />
-              </div>
 
               {/* Blue Login Button */}
               <button
@@ -761,10 +628,10 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
         {viewMode === 'register' && (
           <div className="bg-white rounded-2xl border border-slate-200/90 shadow-md max-w-xl w-full p-6 sm:p-8 animate-fadeIn">
             
-            {/* 3-Step Wizard Indicator Bar (Numbered Circles 1 - 2 - 3) */}
+            {/* 2-Step Wizard Indicator Bar (Numbered Circles 1 - 2) */}
             <div className="flex items-center justify-between max-w-xs mx-auto mb-8 relative">
               {/* Connecting Line */}
-              <div className="absolute top-1/2 left-4 right-4 -translate-y-1/2 h-0.5 bg-blue-500 -z-0"></div>
+              <div className="absolute top-1/2 left-8 right-8 -translate-y-1/2 h-0.5 bg-blue-500 -z-0"></div>
 
               {/* Step 1 Circle */}
               <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs z-10 ${
@@ -778,13 +645,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
                 regStep >= 2 ? 'bg-blue-600 text-white ring-4 ring-blue-100' : 'bg-slate-100 text-slate-500 border border-slate-300'
               }`}>
                 2
-              </div>
-
-              {/* Step 3 Circle */}
-              <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs z-10 ${
-                regStep === 3 ? 'bg-blue-600 text-white ring-4 ring-blue-100' : 'bg-slate-100 text-slate-500 border border-slate-300'
-              }`}>
-                3
               </div>
             </div>
 
@@ -962,13 +822,13 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
 
             {/* STEP 2: CONTACT, SECURITY & INDUSTRIAL PROFILE */}
             {regStep === 2 && (
-              <form onSubmit={handleSendOtpStep2} className="space-y-4">
+              <form onSubmit={handleRegisterSubmit} className="space-y-4">
                 <div>
                   <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
                     <span>📱</span> {t('login.step2', '2. Contact & Security')}
                   </h3>
                   <p className="text-xs text-slate-500">
-                    SMS OTP will be dispatched to your phone number for identity verification
+                    Provide your contact details and create a password for direct enterprise authentication
                   </p>
                 </div>
 
@@ -990,7 +850,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
 
                   <div>
                     <label className="block text-xs font-bold text-slate-800 mb-1">
-                      {t('login.mobileNumber', 'Mobile Number (for SMS OTP)')} <span className="text-rose-500">*</span>
+                      {t('login.mobileNumber', 'Mobile Number')} <span className="text-rose-500">*</span>
                     </label>
                     <div className="flex border border-slate-300 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-blue-500">
                       <span className="inline-flex items-center px-2.5 bg-slate-50 text-slate-700 text-xs font-semibold border-r border-slate-200">
@@ -1018,8 +878,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
                     <input
                       type="password"
                       required
-                      minLength={8}
-                      placeholder="Min 8 characters"
+                      minLength={6}
+                      placeholder="Min 6 characters"
                       value={regForm.password}
                       onChange={(e) => setRegForm({ ...regForm, password: e.target.value })}
                       className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 bg-white text-slate-900 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 font-medium"
@@ -1033,7 +893,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
                     <input
                       type="password"
                       required
-                      minLength={8}
+                      minLength={6}
                       placeholder="Re-enter password"
                       value={regForm.confirmPassword}
                       onChange={(e) => setRegForm({ ...regForm, confirmPassword: e.target.value })}
@@ -1094,7 +954,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
                   </div>
                 </div>
 
-                {/* Navigation Buttons: Go Back, Prev, Send OTP */}
+                {/* Navigation Buttons: Go Back, Prev, Complete Registration */}
                 <div className="grid grid-cols-3 gap-2 sm:gap-3 pt-4 border-t border-slate-100">
                   <button
                     type="button"
@@ -1116,83 +976,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
                     className="py-2.5 px-2 sm:px-4 rounded-lg bg-[#2563eb] hover:bg-[#1d4ed8] text-white font-bold text-xs transition-all cursor-pointer text-center flex items-center justify-center gap-1.5 shadow-md shadow-blue-900/20 min-h-[44px]"
                   >
                     {isLoading ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : null}
-                    Send SMS OTP
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {/* STEP 3: OTP VERIFICATION (Only Mobile OTP sent to phone number) */}
-            {regStep === 3 && (
-              <form onSubmit={handleVerifyOtpStep3} className="space-y-5">
-                <div>
-                  <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
-                    <span>🔐</span> {t('login.step3', '3. Mobile OTP Verification')}
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Enter the 6-digit verification code received on +91 {regForm.mobile}
-                  </p>
-                </div>
-
-                <div className="p-3.5 rounded-xl bg-blue-50 border border-blue-200 text-blue-900 text-xs space-y-1">
-                  <div className="font-bold flex items-center gap-1.5">
-                    <span>📲</span> Mobile Verification Code for +91 {regForm.mobile}
-                  </div>
-                  <p className="text-slate-600">
-                    A secure 6-digit one-time passcode has been sent to your phone. It is valid for 10 minutes.
-                  </p>
-                  <p className="text-emerald-700 font-semibold text-[11px] pt-1 flex items-center gap-1">
-                    <span>✓</span> Testing Mode: Enter any 6 digits (e.g. 123456) to verify & log in immediately.
-                  </p>
-                </div>
-
-                {/* Enter Mobile OTP */}
-                <div>
-                  <label className="block text-xs font-bold text-slate-800 mb-1">
-                    Enter 6-Digit Mobile OTP <span className="text-rose-500">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    maxLength={6}
-                    autoComplete="one-time-code"
-                    placeholder="Enter any code (e.g. 123456)"
-                    value={regForm.mobileOtp}
-                    onChange={(e) => setRegForm({ ...regForm, mobileOtp: e.target.value.replace(/\D/g, '') })}
-                    className="w-full px-3.5 py-3 rounded-lg border-2 border-blue-500 bg-white text-slate-900 text-center text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono font-black tracking-widest"
-                  />
-                </div>
-
-                {/* Navigation Buttons: 2x2 on mobile, 4 in row on desktop */}
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-2.5 pt-4 border-t border-slate-100">
-                  <button
-                    type="button"
-                    onClick={handleReturnToHome}
-                    className="py-2.5 px-3 rounded-lg bg-slate-600 hover:bg-slate-700 text-white font-bold text-xs transition-all cursor-pointer text-center min-h-[44px]"
-                  >
-                    {t('login.backToPortal', 'Go Back')}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => { setRegStep(2); setStatusMessage(null); }}
-                    className="py-2.5 px-3 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-xs transition-all cursor-pointer text-center min-h-[44px]"
-                  >
-                    {t('login.btnPrev', 'Prev')}
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={isLoading}
-                    className="py-2.5 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs transition-all cursor-pointer text-center flex items-center justify-center gap-1 shadow-md shadow-emerald-900/20 min-h-[44px]"
-                  >
-                    {isLoading ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : null}
-                    Verify OTP
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleSendOtpStep2}
-                    className="py-2.5 px-3 rounded-lg bg-orange-600 hover:bg-orange-700 text-white font-bold text-xs transition-all cursor-pointer text-center min-h-[44px]"
-                  >
-                    Resend
+                    Register Account
                   </button>
                 </div>
               </form>
