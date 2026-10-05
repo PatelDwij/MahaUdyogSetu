@@ -4,7 +4,6 @@ import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import { GoogleGenAI } from "@google/genai";
-import { createServer as createViteServer } from "vite";
 import { createClient } from "@supabase/supabase-js";
 import twilio from "twilio";
 import { RegulatoryIngestionEngine } from "./src/server/regulatory/ingestionEngine";
@@ -62,7 +61,20 @@ export function createRateLimiter(options: { windowMs: number; max: number; mess
       return next();
     }
 
-    const ip = req.ip || (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "127.0.0.1";
+    let ip = "127.0.0.1";
+    try {
+      const forwardedFor = req.headers["x-forwarded-for"];
+      if (typeof forwardedFor === "string") {
+        ip = forwardedFor.split(",")[0].trim();
+      } else if (Array.isArray(forwardedFor) && forwardedFor[0]) {
+        ip = forwardedFor[0].trim();
+      } else if (req.socket && req.socket.remoteAddress) {
+        ip = req.socket.remoteAddress;
+      }
+    } catch {
+      ip = "127.0.0.1";
+    }
+
     const key = `${req.path}:${ip}`;
     const now = Date.now();
 
@@ -74,9 +86,11 @@ export function createRateLimiter(options: { windowMs: number; max: number; mess
       record.count++;
     }
 
-    res.setHeader("X-RateLimit-Limit", options.max);
-    res.setHeader("X-RateLimit-Remaining", Math.max(0, options.max - record.count));
-    res.setHeader("X-RateLimit-Reset", Math.ceil(record.resetTime / 1000));
+    try {
+      res.setHeader("X-RateLimit-Limit", options.max);
+      res.setHeader("X-RateLimit-Remaining", Math.max(0, options.max - record.count));
+      res.setHeader("X-RateLimit-Reset", Math.ceil(record.resetTime / 1000));
+    } catch {}
 
     if (record.count > options.max) {
       return res.status(429).json({
@@ -90,6 +104,17 @@ export function createRateLimiter(options: { windowMs: number; max: number; mess
 
 // 3. Body parser with strict payload size limits
 app.use(express.json({ limit: "15mb" }));
+
+// 3.5. Universal URL normalizer for Vercel Serverless / multi-environment hosting
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  const matchedPath = (req.headers["x-matched-path"] as string) || (req.headers["x-invoke-path"] as string);
+  if (matchedPath && matchedPath.startsWith("/api") && req.url !== matchedPath) {
+    req.url = matchedPath;
+  } else if (!req.url.startsWith("/api") && !req.url.startsWith("/assets") && req.url !== "/favicon.ico") {
+    req.url = "/api" + (req.url.startsWith("/") ? req.url : "/" + req.url);
+  }
+  next();
+});
 
 // Initialize Supabase Client (Backend)
 const supabaseUrl = process.env.SUPABASE_URL || "https://iiqdnregrpeocsghmrtv.supabase.co";
@@ -7086,9 +7111,15 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   });
 });
 
-// Vite Middleware or Static Serving
+// Vite Middleware or Static Serving (Local development only - bypassed on Vercel)
 export async function setupVite() {
+  const isVercel = !!process.env.VERCEL || !!process.env.VERCEL_ENV || !!process.env.NOW_REGION;
+  if (isVercel) {
+    return;
+  }
+
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true, allowedHosts: true },
       appType: "spa",
@@ -7107,7 +7138,12 @@ export async function setupVite() {
   });
 }
 
-const isMain = process.argv[1] && (process.argv[1].endsWith("server.ts") || process.argv[1].endsWith("server.cjs") || process.argv[1].endsWith("server.js"));
+const isVercel = !!process.env.VERCEL || !!process.env.VERCEL_ENV || !!process.env.NOW_REGION;
+const isMain = !isVercel && process.argv[1] && (
+  process.argv[1].endsWith("server.ts") || 
+  process.argv[1].endsWith("server.cjs") || 
+  (process.argv[1].endsWith("server.js") && !process.argv[1].includes(".vercel") && !process.argv[1].includes("/var/task"))
+);
 if (isMain && process.env.NODE_ENV !== "test") {
   setupVite().catch((err) => {
     console.error("Failed to start server:", err);
