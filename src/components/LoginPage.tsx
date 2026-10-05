@@ -184,7 +184,16 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
           handlesHazardous: regForm.handlesHazardous
         }),
       });
-      const data = await res.json();
+      let data: any = {};
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        data = await res.json();
+      } else {
+        const text = await res.text();
+        if (!res.ok) {
+          throw new Error(text || `Server connection error (${res.status}). Please ensure the server is running.`);
+        }
+      }
 
       if (!res.ok || data.error) {
         throw new Error(data.error || 'Registration failed. Please check the details provided.');
@@ -250,7 +259,16 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
           password: loginForm.password
         }),
       });
-      const data = await res.json();
+      let data: any = {};
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        data = await res.json();
+      } else {
+        const text = await res.text();
+        if (!res.ok) {
+          throw new Error(text || `Server connection error (${res.status}). Please ensure the server is running.`);
+        }
+      }
 
       if (!res.ok || data.error) {
         throw new Error(data.error || 'Authentication failed. Please verify your credentials.');
