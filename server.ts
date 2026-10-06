@@ -107,13 +107,29 @@ app.use(express.json({ limit: "15mb" }));
 
 // 3.5. Universal URL normalizer for Vercel Serverless / multi-environment hosting
 app.use((req: Request, _res: Response, next: NextFunction) => {
-  const matchedPath = (req.headers["x-matched-path"] as string) || (req.headers["x-invoke-path"] as string);
-  if (matchedPath && matchedPath.startsWith("/api") && req.url !== matchedPath) {
-    req.url = matchedPath;
-  } else if (!req.url.startsWith("/api") && !req.url.startsWith("/assets") && req.url !== "/favicon.ico") {
+  // If the request doesn't have /api prefix and is not a static asset, prepend /api
+  if (!req.url.startsWith("/api") && !req.url.startsWith("/assets") && req.url !== "/favicon.ico") {
     req.url = "/api" + (req.url.startsWith("/") ? req.url : "/" + req.url);
   }
   next();
+});
+
+// Root API & Health Endpoints
+app.get("/api", (_req: Request, res: Response) => {
+  res.json({
+    status: "ok",
+    service: "MahaUdyogSetu API",
+    version: "1.0.0",
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get("/api/health", (_req: Request, res: Response) => {
+  res.json({
+    status: "healthy",
+    service: "MahaUdyogSetu API",
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Initialize Supabase Client (Backend)
@@ -7085,7 +7101,7 @@ app.get("/api/public-dashboard/export", requireCompanyAuth, async (req: Request,
 // =========================================================================
 
 // Handle unmatched API routes with clean JSON 404
-app.all("/api/*", (_req: Request, res: Response) => {
+app.all(["/api", "/api/*"], (_req: Request, res: Response) => {
   return res.status(404).json({
     error: "API endpoint not found."
   });
@@ -7119,7 +7135,8 @@ export async function setupVite() {
   }
 
   if (process.env.NODE_ENV !== "production") {
-    const { createServer: createViteServer } = await import("vite");
+    const vitePkg = "vite";
+    const { createServer: createViteServer } = await import(/* @vite-ignore */ vitePkg);
     const vite = await createViteServer({
       server: { middlewareMode: true, allowedHosts: true },
       appType: "spa",
@@ -7139,7 +7156,7 @@ export async function setupVite() {
 }
 
 const isVercel = !!process.env.VERCEL || !!process.env.VERCEL_ENV || !!process.env.NOW_REGION;
-const isMain = !isVercel && process.argv[1] && (
+const isMain = !isVercel && Boolean(process.argv && process.argv[1]) && (
   process.argv[1].endsWith("server.ts") || 
   process.argv[1].endsWith("server.cjs") || 
   (process.argv[1].endsWith("server.js") && !process.argv[1].includes(".vercel") && !process.argv[1].includes("/var/task"))

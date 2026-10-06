@@ -191,7 +191,9 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
       } else {
         const text = await res.text();
         if (!res.ok) {
-          throw new Error(text || `Server connection error (${res.status}). Please ensure the server is running.`);
+          const isPlatformError = text.includes('FUNCTION_INVOCATION_FAILED') || text.includes('<!DOCTYPE') || text.includes('<html>');
+          const cleanErr = isPlatformError ? 'Authentication service is momentarily unavailable. Please try again in a moment.' : (text || `Server connection error (${res.status}). Please ensure the server is running.`);
+          throw new Error(cleanErr);
         }
       }
 
@@ -266,7 +268,9 @@ export const LoginPage: React.FC<LoginPageProps> = ({ initialView, onLoginSucces
       } else {
         const text = await res.text();
         if (!res.ok) {
-          throw new Error(text || `Server connection error (${res.status}). Please ensure the server is running.`);
+          const isPlatformError = text.includes('FUNCTION_INVOCATION_FAILED') || text.includes('<!DOCTYPE') || text.includes('<html>');
+          const cleanErr = isPlatformError ? 'Authentication service is momentarily unavailable. Please try again in a moment.' : (text || `Server connection error (${res.status}). Please ensure the server is running.`);
+          throw new Error(cleanErr);
         }
       }
 
