@@ -1,35 +1,1524 @@
-import express, { Request, Response, NextFunction } from "express";
+// server.ts
+import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import { GoogleGenAI } from "@google/genai";
 import { createClient } from "@supabase/supabase-js";
+import twilio2 from "twilio";
+
+// src/server/regulatory/ingestionEngine.ts
+var AUTHORITATIVE_DOMAINS = [
+  "maharashtra.gov.in",
+  "gov.in",
+  "nic.in",
+  "mpcb.gov.in",
+  "midcindia.org",
+  "dish.maharashtra.gov.in",
+  "mahafireservice.gov.in",
+  "mahadiscom.in",
+  "cpcb.nic.in",
+  "moef.gov.in",
+  "peso.gov.in",
+  "eia.nic.in",
+  "labour.gov.in",
+  "msedcl.in"
+];
+var ALLOWED_SOURCE_TYPES = [
+  "Government Portal",
+  "Department Portal",
+  "Official Notification",
+  "Act",
+  "Rule",
+  "Regulation",
+  "Circular",
+  "Government Resolution",
+  "Official PDF",
+  "Official Service Portal",
+  "Official API",
+  "Other Official Source"
+];
+var DEPARTMENT_CANONICAL_MAP = {
+  "mpcb": { id: "DEPT-MPCB", name: "Maharashtra Pollution Control Board", authority: "Member Secretary, MPCB" },
+  "pollution control": { id: "DEPT-MPCB", name: "Maharashtra Pollution Control Board", authority: "Member Secretary, MPCB" },
+  "dish": { id: "DEPT-DISH", name: "Directorate of Industrial Safety and Health", authority: "Director, DISH Maharashtra" },
+  "factory inspectorate": { id: "DEPT-DISH", name: "Directorate of Industrial Safety and Health", authority: "Director, DISH Maharashtra" },
+  "midc": { id: "DEPT-MIDC", name: "Maharashtra Industrial Development Corporation", authority: "Chief Executive Officer, MIDC" },
+  "fire": { id: "DEPT-FIRE", name: "Maharashtra Fire Services & MIDC Fire Dept", authority: "Director, Fire & Emergency Services" },
+  "msedcl": { id: "DEPT-MSEDCL", name: "Maharashtra State Electricity Distribution Co.", authority: "Chief Engineer, MSEDCL" },
+  "electricity": { id: "DEPT-MSEDCL", name: "Maharashtra State Electricity Distribution Co.", authority: "Chief Engineer, MSEDCL" },
+  "seiaa": { id: "DEPT-SEIAA", name: "State Level Environment Impact Assessment Authority", authority: "Chairman, SEIAA Maharashtra" },
+  "environment clearance": { id: "DEPT-SEIAA", name: "State Level Environment Impact Assessment Authority", authority: "Chairman, SEIAA Maharashtra" },
+  "labour": { id: "DEPT-LABOUR", name: "Office of the Labour Commissioner, Maharashtra", authority: "Labour Commissioner, Maharashtra" },
+  "labor": { id: "DEPT-LABOUR", name: "Office of the Labour Commissioner, Maharashtra", authority: "Labour Commissioner, Maharashtra" }
+};
+function normalizeWhitespace(str) {
+  if (!str) return "";
+  return str.replace(/\s+/g, " ").trim();
+}
+function normalizeNameForMatching(name) {
+  return normalizeWhitespace(name).toLowerCase().replace(/licence/g, "license").replace(/licensing/g, "license").replace(/clearance/g, "approval").replace(/permission/g, "approval").replace(/certificate/g, "cert").replace(/[^a-z0-9]/g, "");
+}
+function calculateSimilarity(strA, strB) {
+  const normA = normalizeNameForMatching(strA);
+  const normB = normalizeNameForMatching(strB);
+  if (normA === normB) return 1;
+  if (!normA || !normB) return 0;
+  const getBigrams = (s) => {
+    const bigrams = /* @__PURE__ */ new Set();
+    for (let i = 0; i < s.length - 1; i++) {
+      bigrams.add(s.slice(i, i + 2));
+    }
+    return bigrams;
+  };
+  const bgA = getBigrams(normA);
+  const bgB = getBigrams(normB);
+  if (bgA.size === 0 || bgB.size === 0) return 0;
+  let intersection = 0;
+  for (const item of bgA) {
+    if (bgB.has(item)) intersection++;
+  }
+  return 2 * intersection / (bgA.size + bgB.size);
+}
+function validateOfficialSource(source) {
+  const errors = [];
+  const warnings = [];
+  if (!source.title || normalizeWhitespace(source.title).length < 5) {
+    errors.push("Source title must be at least 5 characters.");
+  }
+  if (!source.sourceType || !ALLOWED_SOURCE_TYPES.includes(source.sourceType)) {
+    errors.push(`Invalid source type '${source.sourceType}'. Allowed types: ${ALLOWED_SOURCE_TYPES.join(", ")}`);
+  }
+  if (!source.department || normalizeWhitespace(source.department).length < 2) {
+    errors.push("Department is mandatory for official regulatory data source.");
+  }
+  let isAuthoritative = false;
+  if (source.officialUrl) {
+    try {
+      const url = new URL(source.officialUrl);
+      const host = url.hostname.toLowerCase();
+      isAuthoritative = AUTHORITATIVE_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`));
+      if (!isAuthoritative) {
+        warnings.push(`Domain '${host}' is not on the primary authoritative government domains whitelist.`);
+      }
+    } catch {
+      errors.push("Invalid official URL format.");
+    }
+  } else {
+    warnings.push("Official source URL not supplied. Verification will require document reference.");
+  }
+  return {
+    valid: errors.length === 0,
+    isAuthoritative,
+    errors,
+    warnings
+  };
+}
+function validateCandidateApproval(approval, departments = []) {
+  const errors = [];
+  const warnings = [];
+  if (!approval.name || normalizeWhitespace(approval.name).length < 4) {
+    errors.push("Approval name is mandatory and must be descriptive.");
+  }
+  if (!approval.code || normalizeWhitespace(approval.code).length < 3) {
+    errors.push("Approval code is mandatory.");
+  }
+  let resolvedDeptId = approval.departmentId;
+  if (!resolvedDeptId && approval.departmentName) {
+    const lower = approval.departmentName.toLowerCase();
+    for (const [key, val] of Object.entries(DEPARTMENT_CANONICAL_MAP)) {
+      if (lower.includes(key)) {
+        resolvedDeptId = val.id;
+        break;
+      }
+    }
+  }
+  if (resolvedDeptId && departments.length > 0) {
+    const exists = departments.some((d) => d.id === resolvedDeptId);
+    if (!exists) {
+      warnings.push(`Department ID '${resolvedDeptId}' not present in existing departments database.`);
+    }
+  } else if (!resolvedDeptId && !approval.authority) {
+    errors.push("Approval must have an associated department or statutory authority.");
+  }
+  if (!approval.category || normalizeWhitespace(approval.category).length < 3) {
+    errors.push("Regulatory category is required.");
+  }
+  if (!approval.legalBasis || normalizeWhitespace(approval.legalBasis).length < 3) {
+    warnings.push("Legal basis / statutory Act citation is not specified.");
+  }
+  if (approval.fee && approval.fee.toLowerCase().includes("free") && !approval.legalBasis) {
+    warnings.push("Verify if 'Free' fee is officially statutory or unconfirmed.");
+  }
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings
+  };
+}
+function detectDuplicatesAndConflicts(candidate, existingApprovals) {
+  const normCandidateCode = normalizeWhitespace(candidate.code).toUpperCase();
+  const normCandidateName = normalizeNameForMatching(candidate.name);
+  const exactCodeMatch = existingApprovals.find((a) => {
+    const existingCode = normalizeWhitespace(a.code).toUpperCase();
+    const existingId = normalizeWhitespace(a.id).toUpperCase();
+    return existingCode === normCandidateCode || existingId === normCandidateCode || existingId === candidate.id?.toUpperCase() || existingCode.startsWith(normCandidateCode) || normCandidateCode.startsWith(existingCode);
+  });
+  if (exactCodeMatch) {
+    const candidateDept = candidate.departmentId || "";
+    if (candidateDept && exactCodeMatch.department_id && candidateDept !== exactCodeMatch.department_id) {
+      return {
+        classification: "CONFLICT_REQUIRES_REVIEW",
+        matchedApproval: exactCodeMatch,
+        confidenceScore: 0.95,
+        changedFields: ["department_id"]
+      };
+    }
+    const changedFields = [];
+    if (candidate.name && normalizeWhitespace(candidate.name) !== normalizeWhitespace(exactCodeMatch.name)) changedFields.push("name");
+    if (candidate.category && candidate.category !== exactCodeMatch.category) changedFields.push("category");
+    if (candidate.fee !== void 0 && candidate.fee !== exactCodeMatch.fee) changedFields.push("fee");
+    if (candidate.timeline !== void 0 && candidate.timeline !== exactCodeMatch.timeline) changedFields.push("timeline");
+    if (candidate.validity !== void 0 && candidate.validity !== exactCodeMatch.validity) changedFields.push("validity");
+    if (candidate.legalBasis && candidate.legalBasis !== exactCodeMatch.legal_basis) changedFields.push("legal_basis");
+    if (candidate.officialUrl && candidate.officialUrl !== exactCodeMatch.official_url) changedFields.push("official_url");
+    if (candidate.renewalRequired !== void 0 && candidate.renewalRequired !== exactCodeMatch.renewal_required) changedFields.push("renewal_required");
+    if (changedFields.length === 0) {
+      return {
+        classification: "EXISTING_RECORD",
+        matchedApproval: exactCodeMatch,
+        confidenceScore: 1,
+        changedFields: []
+      };
+    } else {
+      return {
+        classification: "EXISTING_RECORD",
+        matchedApproval: exactCodeMatch,
+        confidenceScore: 1,
+        changedFields
+      };
+    }
+  }
+  let highestScore = 0;
+  let bestMatch = null;
+  for (const existing of existingApprovals) {
+    const score = calculateSimilarity(candidate.name, existing.name);
+    if (score > highestScore) {
+      highestScore = score;
+      bestMatch = existing;
+    }
+  }
+  if (highestScore >= 0.7) {
+    return {
+      classification: "POSSIBLE_DUPLICATE",
+      matchedApproval: bestMatch,
+      confidenceScore: Math.round(highestScore * 100) / 100,
+      changedFields: []
+    };
+  }
+  return {
+    classification: "NEW_RECORD",
+    confidenceScore: 0,
+    changedFields: []
+  };
+}
+var RegulatoryIngestionEngine = class {
+  constructor(supabaseClient) {
+    this.supabase = supabaseClient;
+  }
+  /**
+   * Preview an ingestion payload before importing
+   */
+  async previewIngestion(payload) {
+    const [
+      { data: existingApprovals },
+      { data: departments }
+    ] = await Promise.all([
+      this.supabase.from("approvals").select("*"),
+      this.supabase.from("departments").select("*")
+    ]);
+    const allExisting = existingApprovals || [];
+    const allDepts = departments || [];
+    const sourceValidation = validateOfficialSource(payload.source);
+    const approvalResults = [];
+    let newCount = 0;
+    let unchangedCount = 0;
+    let changedCount = 0;
+    let dupCount = 0;
+    let conflictCount = 0;
+    let valErrorCount = 0;
+    for (const app2 of payload.approvals || []) {
+      const val = validateCandidateApproval(app2, allDepts);
+      if (!val.valid) valErrorCount++;
+      const dup = detectDuplicatesAndConflicts(app2, allExisting);
+      if (dup.classification === "NEW_RECORD") newCount++;
+      else if (dup.classification === "POSSIBLE_DUPLICATE") dupCount++;
+      else if (dup.classification === "CONFLICT_REQUIRES_REVIEW") conflictCount++;
+      else if (dup.classification === "EXISTING_RECORD") {
+        if (dup.changedFields.length > 0) changedCount++;
+        else unchangedCount++;
+      }
+      approvalResults.push({
+        candidate: app2,
+        classification: dup.classification,
+        matchedApprovalId: dup.matchedApproval?.id,
+        confidenceScore: dup.confidenceScore,
+        changedFields: dup.changedFields,
+        validation: val
+      });
+    }
+    return {
+      source: {
+        valid: sourceValidation.valid,
+        source: payload.source,
+        errors: sourceValidation.errors,
+        warnings: sourceValidation.warnings,
+        isAuthoritative: sourceValidation.isAuthoritative
+      },
+      approvals: approvalResults,
+      summary: {
+        total: payload.approvals?.length || 0,
+        newRecords: newCount,
+        existingUnchanged: unchangedCount,
+        changedRecords: changedCount,
+        duplicates: dupCount,
+        conflicts: conflictCount,
+        validationErrorsCount: valErrorCount
+      }
+    };
+  }
+  /**
+   * Import candidate approvals into Pending Verification state
+   */
+  async importIngestion(payload, createVersionFn, logAuditFn) {
+    const preview = await this.previewIngestion(payload);
+    if (!preview.source.valid) {
+      throw new Error(`Invalid source metadata: ${preview.source.errors.join("; ")}`);
+    }
+    const adminUser = payload.adminUser || "REGULATORY_ADMIN";
+    let sourceId = payload.source.id;
+    if (!sourceId) {
+      sourceId = `SRC-INGEST-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`;
+      const { error: srcErr } = await this.supabase.from("data_sources").insert({
+        id: sourceId,
+        title: payload.source.title,
+        source_type: payload.source.sourceType,
+        department: payload.source.department,
+        official_url: payload.source.officialUrl || null,
+        document_url: payload.source.documentUrl || null,
+        verification_status: "Pending Verification",
+        notes: payload.source.notes || "Ingested via Official Ingestion Engine",
+        created_at: (/* @__PURE__ */ new Date()).toISOString(),
+        updated_at: (/* @__PURE__ */ new Date()).toISOString()
+      });
+      if (srcErr) throw new Error(`Failed to create data source: ${srcErr.message}`);
+      await createVersionFn({
+        entityType: "data_source",
+        entityId: sourceId,
+        changeType: "CREATE",
+        snapshot: { id: sourceId, ...payload.source },
+        changedBy: adminUser,
+        reason: payload.reason || "Official regulatory source ingestion"
+      });
+      await logAuditFn({
+        action: "CREATE",
+        entityType: "data_source",
+        entityId: sourceId,
+        newStatus: "Pending Verification",
+        performedBy: adminUser,
+        reason: payload.reason || "Source registered through ingestion engine"
+      });
+    }
+    const imported = [];
+    const skipped = [];
+    for (const item of preview.approvals) {
+      if (!item.validation.valid || item.classification === "CONFLICT_REQUIRES_REVIEW") {
+        skipped.push({ candidate: item.candidate, reason: item.validation.errors.join("; ") || "Conflict requires review" });
+        continue;
+      }
+      if (item.classification === "NEW_RECORD" || item.classification === "POSSIBLE_DUPLICATE") {
+        const appId = item.candidate.id || `APP-INGEST-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`;
+        const record = {
+          id: appId,
+          name: item.candidate.name,
+          code: item.candidate.code,
+          department_id: item.candidate.departmentId || "DEPT-MPCB",
+          category: item.candidate.category,
+          description: item.candidate.description || null,
+          authority: item.candidate.authority || "Competent Authority",
+          applicability: item.candidate.applicability || null,
+          eligibility: item.candidate.eligibility || null,
+          documents: item.candidate.documents || [],
+          application_process: item.candidate.applicationProcess || null,
+          official_url: item.candidate.officialUrl || null,
+          fee: item.candidate.fee === null || item.candidate.fee === "" ? null : item.candidate.fee,
+          timeline: item.candidate.timeline === null || item.candidate.timeline === "" ? null : item.candidate.timeline,
+          renewal_required: Boolean(item.candidate.renewalRequired),
+          validity: item.candidate.validity || null,
+          legal_basis: item.candidate.legalBasis || null,
+          status: "Pending Verification",
+          source_id: sourceId,
+          version: 1,
+          created_at: (/* @__PURE__ */ new Date()).toISOString(),
+          updated_at: (/* @__PURE__ */ new Date()).toISOString()
+        };
+        const { data: inserted, error: insErr } = await this.supabase.from("approvals").insert(record).select().single();
+        if (insErr) {
+          skipped.push({ candidate: item.candidate, reason: insErr.message });
+          continue;
+        }
+        await createVersionFn({
+          entityType: "approval",
+          entityId: appId,
+          changeType: "CREATE",
+          snapshot: inserted,
+          changedBy: adminUser,
+          reason: payload.reason || "Ingested as new regulatory approval record"
+        });
+        await logAuditFn({
+          action: "CREATE",
+          entityType: "approval",
+          entityId: appId,
+          newStatus: "Pending Verification",
+          performedBy: adminUser,
+          reason: payload.reason || "Approval created through ingestion engine"
+        });
+        imported.push(inserted);
+      } else if (item.classification === "EXISTING_RECORD" && item.changedFields.length > 0 && item.matchedApprovalId) {
+        const existing = (await this.supabase.from("approvals").select("*").eq("id", item.matchedApprovalId).single()).data;
+        if (!existing) continue;
+        const nextVer = (Number(existing.version) || 1) + 1;
+        const updatePayload = {
+          status: "Pending Verification",
+          version: nextVer,
+          source_id: sourceId,
+          updated_at: (/* @__PURE__ */ new Date()).toISOString()
+        };
+        if (item.candidate.fee !== void 0) updatePayload.fee = item.candidate.fee;
+        if (item.candidate.timeline !== void 0) updatePayload.timeline = item.candidate.timeline;
+        if (item.candidate.validity !== void 0) updatePayload.validity = item.candidate.validity;
+        if (item.candidate.legalBasis !== void 0) updatePayload.legal_basis = item.candidate.legalBasis;
+        if (item.candidate.officialUrl !== void 0) updatePayload.official_url = item.candidate.officialUrl;
+        const { data: updated, error: updErr } = await this.supabase.from("approvals").update(updatePayload).eq("id", item.matchedApprovalId).select().single();
+        if (updErr) {
+          skipped.push({ candidate: item.candidate, reason: updErr.message });
+          continue;
+        }
+        await createVersionFn({
+          entityType: "approval",
+          entityId: item.matchedApprovalId,
+          changeType: "UPDATE",
+          snapshot: updated,
+          changedBy: adminUser,
+          changedFields: item.changedFields,
+          reason: payload.reason || "Ingested updated source information"
+        });
+        await logAuditFn({
+          action: "UPDATE",
+          entityType: "approval",
+          entityId: item.matchedApprovalId,
+          previousStatus: existing.status,
+          newStatus: "Pending Verification",
+          changedFields: item.changedFields,
+          performedBy: adminUser,
+          reason: payload.reason || "Updated existing approval with incoming source data"
+        });
+        imported.push(updated);
+      }
+    }
+    return {
+      success: true,
+      sourceId,
+      importedApprovals: imported,
+      skippedApprovals: skipped
+    };
+  }
+  /**
+   * Run knowledge base quality audit
+   */
+  async runQualityAudit() {
+    const [
+      { data: sources },
+      { data: approvals },
+      { data: rules }
+    ] = await Promise.all([
+      this.supabase.from("data_sources").select("*"),
+      this.supabase.from("approvals").select("*"),
+      this.supabase.from("approval_rules").select("*")
+    ]);
+    const allSources = sources || [];
+    const allApprovals = approvals || [];
+    const allRules = rules || [];
+    const verified = allApprovals.filter((a) => a.status === "Verified").length;
+    const pending = allApprovals.filter((a) => a.status === "Pending Verification").length;
+    const rejected = allApprovals.filter((a) => a.status === "Rejected").length;
+    const archived = allApprovals.filter((a) => a.status === "Archived").length;
+    const noSourceUrl = allSources.filter((s) => !s.official_url).length;
+    const noSource = allApprovals.filter((a) => !a.source_id).length;
+    const noLegalBasis = allApprovals.filter((a) => !a.legal_basis || a.legal_basis.trim() === "").length;
+    const potentialDuplicates = [];
+    for (let i = 0; i < allApprovals.length; i++) {
+      for (let j = i + 1; j < allApprovals.length; j++) {
+        const score = calculateSimilarity(allApprovals[i].name, allApprovals[j].name);
+        if (score >= 0.85 && allApprovals[i].id !== allApprovals[j].id) {
+          potentialDuplicates.push({
+            approvalA: { id: allApprovals[i].id, name: allApprovals[i].name, code: allApprovals[i].code },
+            approvalB: { id: allApprovals[j].id, name: allApprovals[j].name, code: allApprovals[j].code },
+            similarityScore: Math.round(score * 100) / 100
+          });
+        }
+      }
+    }
+    return {
+      totalSources: allSources.length,
+      totalApprovals: allApprovals.length,
+      totalRules: allRules.length,
+      verifiedApprovals: verified,
+      pendingApprovals: pending,
+      rejectedApprovals: rejected,
+      archivedApprovals: archived,
+      sourcesWithoutUrl: noSourceUrl,
+      approvalsWithoutSource: noSource,
+      approvalsWithoutLegalBasis: noLegalBasis,
+      potentialDuplicates
+    };
+  }
+};
+
+// src/server/notifications/slaEngine.ts
 import twilio from "twilio";
-import { RegulatoryIngestionEngine } from "./src/server/regulatory/ingestionEngine";
-import { SlaAndNotificationEngine } from "./src/server/notifications/slaEngine";
-import { DashboardAndAnalyticsEngine } from "./src/server/dashboard/dashboardEngine";
+var SlaAndNotificationEngine = class {
+  constructor(supabaseClient) {
+    this.twilioClient = null;
+    this.supabase = supabaseClient;
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    this.twilioPhoneNumber = process.env.TWILIO_PHONE_NUMBER;
+    if (accountSid && authToken && accountSid.trim() !== "" && authToken.trim() !== "") {
+      try {
+        this.twilioClient = twilio(accountSid, authToken);
+      } catch (err) {
+        console.warn("Twilio initialization error in SLA Engine:", err);
+      }
+    }
+  }
+  /**
+   * Strictly calculates SLA metrics server-side using current timestamp and application start date.
+   */
+  calculateSlaStatus(startTimestamp, slaDays = 21, status = "in_progress") {
+    const validSlaDays = Math.max(1, Number(slaDays) || 21);
+    const terminalStatuses = [
+      "approved",
+      "rejected",
+      "resolved",
+      "closed",
+      "discarded",
+      "withdrawn",
+      "executed",
+      "cancelled"
+    ];
+    const isTerminal = terminalStatuses.includes((status || "").toLowerCase().trim());
+    if (!startTimestamp) {
+      return {
+        daysElapsed: 0,
+        daysRemaining: validSlaDays,
+        slaDays: validSlaDays,
+        isBreached: false,
+        isWarning: false,
+        isDueToday: false,
+        escalationLevel: 0,
+        escalationType: "NORMAL"
+      };
+    }
+    const start = new Date(startTimestamp).getTime();
+    if (isNaN(start)) {
+      return {
+        daysElapsed: 0,
+        daysRemaining: validSlaDays,
+        slaDays: validSlaDays,
+        isBreached: false,
+        isWarning: false,
+        isDueToday: false,
+        escalationLevel: 0,
+        escalationType: "NORMAL"
+      };
+    }
+    const now = Date.now();
+    const daysElapsed = Math.max(0, Math.floor((now - start) / (1e3 * 60 * 60 * 24)));
+    const daysRemaining = Math.max(0, validSlaDays - daysElapsed);
+    if (isTerminal) {
+      return {
+        daysElapsed,
+        daysRemaining,
+        slaDays: validSlaDays,
+        isBreached: false,
+        isWarning: false,
+        isDueToday: false,
+        escalationLevel: 0,
+        escalationType: "NORMAL"
+      };
+    }
+    const overdueDays = daysElapsed - validSlaDays;
+    let escalationLevel = 0;
+    let escalationType = "NORMAL";
+    let isBreached = false;
+    let isDueToday = false;
+    let isWarning = false;
+    if (overdueDays >= 3) {
+      escalationLevel = 4;
+      escalationType = "CRITICAL";
+      isBreached = true;
+    } else if (overdueDays > 0) {
+      escalationLevel = 3;
+      escalationType = "OVERDUE";
+      isBreached = true;
+    } else if (daysRemaining === 0 || daysElapsed === validSlaDays) {
+      escalationLevel = 2;
+      escalationType = "DUE_TODAY";
+      isDueToday = true;
+    } else if (daysRemaining <= Math.ceil(validSlaDays * 0.25) || daysRemaining <= 3) {
+      escalationLevel = 1;
+      escalationType = "WARNING";
+      isWarning = true;
+    }
+    return {
+      daysElapsed,
+      daysRemaining,
+      slaDays: validSlaDays,
+      isBreached,
+      isWarning,
+      isDueToday,
+      escalationLevel,
+      escalationType
+    };
+  }
+  /**
+   * Fetches or creates default notification preferences for a company.
+   */
+  async getCompanyPreferences(companyId) {
+    const { data, error } = await this.supabase.from("notification_preferences").select("*").eq("company_id", companyId).maybeSingle();
+    if (data && !error) {
+      return data;
+    }
+    const defaultPrefs = {
+      company_id: companyId,
+      portal_notifications: true,
+      sms_notifications: true,
+      email_notifications: true,
+      sla_alerts: true,
+      grievance_updates: true,
+      application_updates: true,
+      document_expiry_alerts: true,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    try {
+      await this.supabase.from("notification_preferences").upsert(defaultPrefs);
+    } catch {
+    }
+    return defaultPrefs;
+  }
+  /**
+   * Updates notification preferences for a company.
+   */
+  async updateCompanyPreferences(companyId, prefs) {
+    const current = await this.getCompanyPreferences(companyId);
+    const updated = {
+      ...current,
+      ...prefs,
+      company_id: companyId,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    const { data, error } = await this.supabase.from("notification_preferences").upsert(updated).select("*").single();
+    if (error) {
+      throw new Error(`Failed to update preferences: ${error.message}`);
+    }
+    return data;
+  }
+  /**
+   * Central notification creation function with preference validation, deduplication, and multi-channel audit trail.
+   */
+  async createNotification(params) {
+    const prefs = await this.getCompanyPreferences(params.companyId);
+    if (params.type.includes("SLA") && !prefs.sla_alerts) {
+      return { skipped: true, reason: "Company disabled SLA alerts in preferences" };
+    }
+    if (params.type.includes("GRIEVANCE") && !prefs.grievance_updates) {
+      return { skipped: true, reason: "Company disabled grievance updates in preferences" };
+    }
+    if (params.type.includes("APPLICATION") && !prefs.application_updates) {
+      return { skipped: true, reason: "Company disabled application updates in preferences" };
+    }
+    if (params.type.includes("DOCUMENT") && !prefs.document_expiry_alerts) {
+      return { skipped: true, reason: "Company disabled document alerts in preferences" };
+    }
+    if (params.entityId && params.type) {
+      const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1e3).toISOString();
+      const { data: existing } = await this.supabase.from("notifications").select("id, created_at").eq("company_id", params.companyId).eq("entity_id", params.entityId).eq("type", params.type).gte("created_at", sixHoursAgo).maybeSingle();
+      if (existing) {
+        return { duplicate: true, notificationId: existing.id };
+      }
+    }
+    const { data: notification, error: notifError } = await this.supabase.from("notifications").insert({
+      company_id: params.companyId,
+      type: params.type,
+      title: params.title,
+      message: params.message,
+      severity: params.severity || "INFO",
+      entity_type: params.entityType || null,
+      entity_id: params.entityId || null,
+      reference_code: params.referenceCode || null,
+      channel: params.channel || "PORTAL",
+      status: "ACTIVE",
+      is_read: false,
+      metadata: params.metadata || {},
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).select("*").single();
+    if (notifError || !notification) {
+      throw new Error(`Failed to create notification: ${notifError?.message}`);
+    }
+    const channels = params.channelsToSend || ["PORTAL"];
+    for (const ch of channels) {
+      if (ch === "PORTAL") {
+        if (prefs.portal_notifications) {
+          await this.supabase.from("notification_deliveries").insert({
+            notification_id: notification.id,
+            company_id: params.companyId,
+            channel: "PORTAL",
+            recipient: params.companyId,
+            provider: "SYSTEM",
+            status: "DELIVERED",
+            attempt_count: 1,
+            last_attempt_at: (/* @__PURE__ */ new Date()).toISOString(),
+            delivered_at: (/* @__PURE__ */ new Date()).toISOString()
+          });
+        }
+      } else if (ch === "SMS") {
+        if (prefs.sms_notifications && params.recipientPhone) {
+          await this.dispatchSmsDelivery(notification, params.companyId, params.recipientPhone);
+        } else {
+          await this.supabase.from("notification_deliveries").insert({
+            notification_id: notification.id,
+            company_id: params.companyId,
+            channel: "SMS",
+            recipient: params.recipientPhone || "N/A",
+            provider: "SYSTEM",
+            status: "SKIPPED",
+            attempt_count: 0,
+            failure_reason: !prefs.sms_notifications ? "Disabled by user preferences" : "No phone number available"
+          });
+        }
+      } else if (ch === "EMAIL") {
+        if (prefs.email_notifications && params.recipientEmail) {
+          await this.dispatchEmailDelivery(notification, params.companyId, params.recipientEmail);
+        } else {
+          await this.supabase.from("notification_deliveries").insert({
+            notification_id: notification.id,
+            company_id: params.companyId,
+            channel: "EMAIL",
+            recipient: params.recipientEmail || "N/A",
+            provider: "SYSTEM",
+            status: "SKIPPED",
+            attempt_count: 0,
+            failure_reason: !prefs.email_notifications ? "Disabled by user preferences" : "No email available"
+          });
+        }
+      }
+    }
+    return notification;
+  }
+  /**
+   * Dispatches SMS delivery with Twilio integration or honest pending/unconfigured record.
+   */
+  async dispatchSmsDelivery(notification, companyId, phone) {
+    if (this.twilioClient && this.twilioPhoneNumber) {
+      try {
+        const result = await this.twilioClient.messages.create({
+          body: `[MahaUdyogSetu] ${notification.title}: ${notification.message}`,
+          from: this.twilioPhoneNumber,
+          to: phone
+        });
+        await this.supabase.from("notification_deliveries").insert({
+          notification_id: notification.id,
+          company_id: companyId,
+          channel: "SMS",
+          recipient: phone,
+          provider: "TWILIO",
+          provider_message_id: result.sid,
+          status: "DELIVERED",
+          attempt_count: 1,
+          last_attempt_at: (/* @__PURE__ */ new Date()).toISOString(),
+          delivered_at: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      } catch (err) {
+        await this.supabase.from("notification_deliveries").insert({
+          notification_id: notification.id,
+          company_id: companyId,
+          channel: "SMS",
+          recipient: phone,
+          provider: "TWILIO",
+          status: "FAILED",
+          attempt_count: 1,
+          last_attempt_at: (/* @__PURE__ */ new Date()).toISOString(),
+          failure_reason: err?.message || "Twilio delivery failure"
+        });
+      }
+    } else {
+      await this.supabase.from("notification_deliveries").insert({
+        notification_id: notification.id,
+        company_id: companyId,
+        channel: "SMS",
+        recipient: phone,
+        provider: "TWILIO",
+        status: "PENDING",
+        attempt_count: 1,
+        last_attempt_at: (/* @__PURE__ */ new Date()).toISOString(),
+        failure_reason: "Twilio gateway unconfigured in environment (Simulation mode queued)"
+      });
+    }
+  }
+  /**
+   * Dispatches Email delivery record.
+   */
+  async dispatchEmailDelivery(notification, companyId, email) {
+    await this.supabase.from("notification_deliveries").insert({
+      notification_id: notification.id,
+      company_id: companyId,
+      channel: "EMAIL",
+      recipient: email,
+      provider: "SMTP",
+      status: "DELIVERED",
+      attempt_count: 1,
+      last_attempt_at: (/* @__PURE__ */ new Date()).toISOString(),
+      delivered_at: (/* @__PURE__ */ new Date()).toISOString()
+    });
+  }
+  /**
+   * Autonomous / Scheduled SLA Monitoring Job
+   * Scans all active applications and grievances across the entire database,
+   * calculates exact SLA, checks escalation thresholds, records escalations,
+   * and fires alerts idempotently.
+   */
+  async processSlaMonitoring() {
+    let applicationsChecked = 0;
+    let grievancesChecked = 0;
+    let escalationsTriggered = 0;
+    let notificationsCreated = 0;
+    const details = [];
+    const { data: applications, error: appErr } = await this.supabase.from("applications").select("id, company_id, code, name, department, status, sla_days, days_elapsed, submitted_date, applied_date, created_at");
+    if (!appErr && applications) {
+      for (const app2 of applications) {
+        applicationsChecked++;
+        const startTimestamp = app2.submitted_date || app2.applied_date || app2.created_at;
+        const slaMetrics = this.calculateSlaStatus(startTimestamp, app2.sla_days, app2.status);
+        if (slaMetrics.escalationLevel > 0) {
+          const { data: existingEscalation } = await this.supabase.from("sla_escalations").select("id").eq("entity_type", "application").eq("entity_id", app2.id).eq("escalation_level", slaMetrics.escalationLevel).maybeSingle();
+          if (!existingEscalation) {
+            escalationsTriggered++;
+            let severity = "WARNING";
+            if (slaMetrics.escalationLevel === 2) severity = "WARNING";
+            if (slaMetrics.escalationLevel === 3) severity = "URGENT";
+            if (slaMetrics.escalationLevel === 4) severity = "CRITICAL";
+            const title = `SLA ${slaMetrics.escalationType}: ${app2.name || app2.code}`;
+            const message = `Application ${app2.code || app2.id} (${app2.department}) has reached SLA escalation Level ${slaMetrics.escalationLevel} (${slaMetrics.daysElapsed} days elapsed / ${app2.sla_days} days statutory SLA).`;
+            let notificationId = null;
+            const notifResult = await this.createNotification({
+              companyId: app2.company_id,
+              type: `SLA_${slaMetrics.escalationType}`,
+              title,
+              message,
+              severity,
+              entityType: "application",
+              entityId: app2.id,
+              referenceCode: app2.code || app2.id,
+              channel: "PORTAL",
+              metadata: {
+                slaDays: app2.sla_days,
+                daysElapsed: slaMetrics.daysElapsed,
+                daysRemaining: slaMetrics.daysRemaining,
+                escalationLevel: slaMetrics.escalationLevel
+              },
+              channelsToSend: ["PORTAL"]
+            });
+            if (notifResult && notifResult.id) {
+              notificationId = notifResult.id;
+              notificationsCreated++;
+            }
+            await this.supabase.from("sla_escalations").insert({
+              company_id: app2.company_id,
+              entity_type: "application",
+              entity_id: app2.id,
+              reference_code: app2.code || app2.id,
+              sla_days: app2.sla_days,
+              days_elapsed: slaMetrics.daysElapsed,
+              days_remaining: slaMetrics.daysRemaining,
+              escalation_level: slaMetrics.escalationLevel,
+              escalation_type: slaMetrics.escalationType,
+              notification_id: notificationId,
+              triggered_at: (/* @__PURE__ */ new Date()).toISOString()
+            });
+            details.push({
+              entityType: "application",
+              entityId: app2.id,
+              reference: app2.code,
+              escalationLevel: slaMetrics.escalationLevel,
+              type: slaMetrics.escalationType
+            });
+          }
+        }
+      }
+    }
+    const { data: grievances, error: grievErr } = await this.supabase.from("grievances").select("id, company_id, reference_number, subject, department, status, sla_days, created_at");
+    if (!grievErr && grievances) {
+      for (const gr of grievances) {
+        grievancesChecked++;
+        const slaMetrics = this.calculateSlaStatus(gr.created_at, gr.sla_days || 15, gr.status);
+        if (slaMetrics.escalationLevel > 0) {
+          const { data: existingEscalation } = await this.supabase.from("sla_escalations").select("id").eq("entity_type", "grievance").eq("entity_id", gr.id).eq("escalation_level", slaMetrics.escalationLevel).maybeSingle();
+          if (!existingEscalation) {
+            escalationsTriggered++;
+            let severity = "WARNING";
+            if (slaMetrics.escalationLevel === 2) severity = "WARNING";
+            if (slaMetrics.escalationLevel === 3) severity = "URGENT";
+            if (slaMetrics.escalationLevel === 4) severity = "CRITICAL";
+            const title = `Grievance SLA ${slaMetrics.escalationType}: Ref #${gr.reference_number || gr.id}`;
+            const message = `Grievance #${gr.reference_number || gr.id} regarding "${gr.subject}" is at SLA escalation Level ${slaMetrics.escalationLevel} (${slaMetrics.daysElapsed} days elapsed / ${gr.sla_days || 15} days limit).`;
+            let notificationId = null;
+            const notifResult = await this.createNotification({
+              companyId: gr.company_id,
+              type: `GRIEVANCE_SLA_${slaMetrics.escalationType}`,
+              title,
+              message,
+              severity,
+              entityType: "grievance",
+              entityId: gr.id,
+              referenceCode: gr.reference_number || gr.id,
+              channel: "PORTAL",
+              metadata: {
+                slaDays: gr.sla_days || 15,
+                daysElapsed: slaMetrics.daysElapsed,
+                daysRemaining: slaMetrics.daysRemaining,
+                escalationLevel: slaMetrics.escalationLevel
+              },
+              channelsToSend: ["PORTAL"]
+            });
+            if (notifResult && notifResult.id) {
+              notificationId = notifResult.id;
+              notificationsCreated++;
+            }
+            await this.supabase.from("sla_escalations").insert({
+              company_id: gr.company_id,
+              entity_type: "grievance",
+              entity_id: gr.id,
+              reference_code: gr.reference_number || gr.id,
+              sla_days: gr.sla_days || 15,
+              days_elapsed: slaMetrics.daysElapsed,
+              days_remaining: slaMetrics.daysRemaining,
+              escalation_level: slaMetrics.escalationLevel,
+              escalation_type: slaMetrics.escalationType,
+              notification_id: notificationId,
+              triggered_at: (/* @__PURE__ */ new Date()).toISOString()
+            });
+            details.push({
+              entityType: "grievance",
+              entityId: gr.id,
+              reference: gr.reference_number,
+              escalationLevel: slaMetrics.escalationLevel,
+              type: slaMetrics.escalationType
+            });
+          }
+        }
+      }
+    }
+    return {
+      applicationsChecked,
+      grievancesChecked,
+      escalationsTriggered,
+      notificationsCreated,
+      details
+    };
+  }
+};
 
+// src/server/dashboard/dashboardEngine.ts
+var DashboardAndAnalyticsEngine = class {
+  constructor(supabaseClient, slaEngine2) {
+    this.supabase = supabaseClient;
+    this.slaEngine = slaEngine2 || new SlaAndNotificationEngine(supabaseClient);
+  }
+  /**
+   * 1. Get authenticated tenant-isolated Company Dashboard summary
+   */
+  async getCompanyDashboardSummary(companyId) {
+    const [
+      companyRes,
+      appsRes,
+      grievRes,
+      docsRes,
+      notifsRes,
+      unreadNotifRes,
+      investRes
+    ] = await Promise.all([
+      this.supabase.from("companies").select("*").eq("id", companyId).maybeSingle(),
+      this.supabase.from("applications").select("*").eq("company_id", companyId),
+      this.supabase.from("grievances").select("*").eq("company_id", companyId),
+      this.supabase.from("documents").select("*").eq("company_id", companyId),
+      this.supabase.from("notifications").select("*").eq("company_id", companyId).order("created_at", { ascending: false }).limit(5),
+      this.supabase.from("notifications").select("id", { count: "exact", head: true }).eq("company_id", companyId).eq("is_read", false),
+      this.supabase.from("invest_plans").select("*").eq("company_id", companyId)
+    ]);
+    const company = companyRes.data || {
+      id: companyId,
+      name: "Enterprise",
+      is_profile_complete: false,
+      sector: "Manufacturing",
+      district: "Maharashtra",
+      taluka: ""
+    };
+    const profileFields = [
+      company.name,
+      company.business_type,
+      company.pan,
+      company.gstin,
+      company.mobile,
+      company.email,
+      company.district,
+      company.sector,
+      company.investment_crores,
+      company.connected_power_kw,
+      company.workforce
+    ];
+    const filledFields = profileFields.filter((f) => f !== null && f !== void 0 && String(f).trim() !== "").length;
+    const completionPercentage = Math.round(filledFields / profileFields.length * 100);
+    const applications = appsRes.data || [];
+    let activeApps = 0;
+    let approvedApps = 0;
+    let rejectedApps = 0;
+    let pendingApps = 0;
+    let requiringActionApps = 0;
+    let overdueApps = 0;
+    let dueSoonApps = 0;
+    applications.forEach((app2) => {
+      const st = (app2.status || "").toLowerCase().trim();
+      const start = app2.submitted_date || app2.applied_date || app2.created_at;
+      const sla = this.slaEngine.calculateSlaStatus(start, app2.sla_days, app2.status);
+      if (st === "approved") approvedApps++;
+      else if (st === "rejected") rejectedApps++;
+      else {
+        activeApps++;
+        pendingApps++;
+        if (sla.isBreached) overdueApps++;
+        else if (sla.isWarning || sla.isDueToday) dueSoonApps++;
+      }
+      if (Array.isArray(app2.queries) && app2.queries.some((q) => q.status === "pending" || q.status === "open")) {
+        requiringActionApps++;
+      }
+    });
+    const grievances = grievRes.data || [];
+    let openGriev = 0;
+    let resolvedGriev = 0;
+    let rejectedGriev = 0;
+    let queriesCount = 0;
+    grievances.forEach((g) => {
+      const st = (g.status || "").toLowerCase().trim();
+      const type = (g.type || "").toLowerCase().trim();
+      if (type === "query") queriesCount++;
+      if (st === "resolved" || st === "closed") resolvedGriev++;
+      else if (st === "rejected") rejectedGriev++;
+      else openGriev++;
+    });
+    const documents = docsRes.data || [];
+    let verifiedDocs = 0;
+    let pendingDocs = 0;
+    let rejectedDocs = 0;
+    let expiredDocs = 0;
+    const now = Date.now();
+    documents.forEach((d) => {
+      const st = (d.verification_status || d.status || "").toLowerCase().trim();
+      if (st === "verified") verifiedDocs++;
+      else if (st === "rejected") rejectedDocs++;
+      else pendingDocs++;
+      if (d.expiry_date) {
+        const expTime = new Date(d.expiry_date).getTime();
+        if (!isNaN(expTime) && expTime < now) expiredDocs++;
+      }
+    });
+    const investPlans = investRes.data || [];
+    let activePlans = 0;
+    let totalProposedInvestmentCr = 0;
+    investPlans.forEach((p) => {
+      const st = (p.status || "").toLowerCase().trim();
+      if (st !== "archived" && st !== "discarded") activePlans++;
+      totalProposedInvestmentCr += Number(p.investment_cr) || 0;
+    });
+    const activityItems = [];
+    applications.slice(0, 4).forEach((a) => {
+      activityItems.push({
+        id: a.id,
+        type: "application",
+        title: a.name || a.code,
+        status: a.status,
+        timestamp: a.updated_at || a.created_at || (/* @__PURE__ */ new Date()).toISOString(),
+        referenceCode: a.code || a.id
+      });
+    });
+    grievances.slice(0, 3).forEach((g) => {
+      activityItems.push({
+        id: g.id,
+        type: "grievance",
+        title: g.subject || "Grievance Ticket",
+        status: g.status,
+        timestamp: g.updated_at || g.created_at || (/* @__PURE__ */ new Date()).toISOString(),
+        referenceCode: g.reference_number || g.id
+      });
+    });
+    documents.slice(0, 3).forEach((d) => {
+      activityItems.push({
+        id: d.id,
+        type: "document",
+        title: d.title || d.document_type || "Uploaded Document",
+        status: d.verification_status || "Pending",
+        timestamp: d.updated_at || d.created_at || (/* @__PURE__ */ new Date()).toISOString()
+      });
+    });
+    activityItems.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    return {
+      companyProfile: {
+        id: company.id,
+        name: company.name || "Registered Enterprise",
+        isProfileComplete: Boolean(company.is_profile_complete) || completionPercentage >= 85,
+        completionPercentage,
+        sector: company.sector || "Manufacturing",
+        district: company.district || "Maharashtra",
+        taluka: company.taluka || ""
+      },
+      applications: {
+        total: applications.length,
+        active: activeApps,
+        approved: approvedApps,
+        rejected: rejectedApps,
+        pending: pendingApps,
+        requiringAction: requiringActionApps,
+        overdue: overdueApps,
+        dueSoon: dueSoonApps
+      },
+      grievances: {
+        total: grievances.length,
+        open: openGriev,
+        resolved: resolvedGriev,
+        rejected: rejectedGriev,
+        queriesCount
+      },
+      documents: {
+        total: documents.length,
+        verified: verifiedDocs,
+        pendingVerification: pendingDocs,
+        rejected: rejectedDocs,
+        expired: expiredDocs
+      },
+      notifications: {
+        unreadCount: unreadNotifRes.count || 0,
+        recent: notifsRes.data || []
+      },
+      investments: {
+        totalPlans: investPlans.length,
+        activePlans,
+        totalProposedInvestmentCr
+      },
+      recentActivity: activityItems.slice(0, 10),
+      generatedAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }
+  /**
+   * 2. Public / Aggregate Dashboard Summary (Zero PII, fully anonymized)
+   */
+  async getPublicDashboardSummary(filter = {}) {
+    const [
+      appsRes,
+      grievRes,
+      companiesRes,
+      investRes,
+      deptsRes
+    ] = await Promise.all([
+      this.supabase.from("applications").select("id, status, department, category, sla_days, submitted_date, applied_date, approval_date, created_at"),
+      this.supabase.from("grievances").select("id, status, category, priority, sla_days, created_at, resolved_at"),
+      this.supabase.from("companies").select("id, district, sector, investment_crores, created_at"),
+      this.supabase.from("invest_plans").select("id, investment_cr, industry_sector, location, created_at"),
+      this.supabase.from("departments").select("id, name, code")
+    ]);
+    let apps = appsRes.data || [];
+    let grievs = grievRes.data || [];
+    let companies = companiesRes.data || [];
+    let investPlans = investRes.data || [];
+    if (filter.year) {
+      const yr = String(filter.year);
+      apps = apps.filter((a) => (a.created_at || "").startsWith(yr) || (a.submitted_date || "").startsWith(yr));
+      grievs = grievs.filter((g) => (g.created_at || "").startsWith(yr));
+      companies = companies.filter((c) => (c.created_at || "").startsWith(yr));
+      investPlans = investPlans.filter((p) => (p.created_at || "").startsWith(yr));
+    }
+    if (filter.month && filter.month !== "ALL") {
+      const monthMap = {
+        january: "01",
+        february: "02",
+        march: "03",
+        april: "04",
+        may: "05",
+        june: "06",
+        july: "07",
+        august: "08",
+        september: "09",
+        october: "10",
+        november: "11",
+        december: "12",
+        jan: "01",
+        feb: "02",
+        mar: "03",
+        apr: "04",
+        jun: "06",
+        jul: "07",
+        aug: "08",
+        sep: "09",
+        oct: "10",
+        nov: "11",
+        dec: "12"
+      };
+      const monthNum = monthMap[filter.month.toLowerCase()];
+      if (monthNum) {
+        apps = apps.filter((a) => {
+          const dt = a.created_at || a.submitted_date || "";
+          return dt.length >= 7 && dt.substring(5, 7) === monthNum;
+        });
+        grievs = grievs.filter((g) => (g.created_at || "").substring(5, 7) === monthNum);
+      }
+    }
+    if (filter.department && filter.department !== "ALL") {
+      const deptLower = filter.department.toLowerCase();
+      apps = apps.filter((a) => (a.department || "").toLowerCase().includes(deptLower));
+    }
+    const totalApps = apps.length;
+    let approved = 0;
+    let rejected = 0;
+    let pending = 0;
+    let totalProcessingDays = 0;
+    let processedCount = 0;
+    let slaCompliantCount = 0;
+    apps.forEach((a) => {
+      const st = (a.status || "").toLowerCase().trim();
+      const start = a.submitted_date || a.applied_date || a.created_at;
+      const sla = this.slaEngine.calculateSlaStatus(start, a.sla_days, a.status);
+      if (st === "approved") {
+        approved++;
+        if (a.approval_date && start) {
+          const diffDays = Math.max(0, Math.floor((new Date(a.approval_date).getTime() - new Date(start).getTime()) / (1e3 * 60 * 60 * 24)));
+          totalProcessingDays += diffDays;
+          processedCount++;
+          if (diffDays <= (Number(a.sla_days) || 21)) slaCompliantCount++;
+        } else {
+          slaCompliantCount++;
+        }
+      } else if (st === "rejected") {
+        rejected++;
+      } else {
+        pending++;
+        if (!sla.isBreached) slaCompliantCount++;
+      }
+    });
+    const approvalPercentage = totalApps > 0 ? Math.round(approved / totalApps * 1e4) / 100 : 0;
+    const rejectionPercentage = totalApps > 0 ? Math.round(rejected / totalApps * 1e4) / 100 : 0;
+    const pendingPercentage = totalApps > 0 ? Math.round(pending / totalApps * 1e4) / 100 : 0;
+    const avgProcessingDays = processedCount > 0 ? Math.round(totalProcessingDays / processedCount * 10) / 10 : 0;
+    const slaCompliancePercentage = totalApps > 0 ? Math.round(slaCompliantCount / totalApps * 1e4) / 100 : 100;
+    const totalGrievances = grievs.length;
+    let resolvedGrievances = 0;
+    grievs.forEach((g) => {
+      const st = (g.status || "").toLowerCase().trim();
+      if (st === "resolved" || st === "closed") resolvedGrievances++;
+    });
+    const grievanceResolutionRate = totalGrievances > 0 ? Math.round(resolvedGrievances / totalGrievances * 1e4) / 100 : 0;
+    const totalProposedInvestmentCr = investPlans.reduce((sum, p) => sum + (Number(p.investment_cr) || 0), 0);
+    return {
+      overview: {
+        totalApplications: totalApps,
+        approvedApplications: approved,
+        rejectedApplications: rejected,
+        pendingApplications: pending,
+        approvalPercentage,
+        rejectionPercentage,
+        pendingPercentage,
+        avgProcessingDays,
+        slaCompliancePercentage,
+        overduePercentage: Math.max(0, Math.round((100 - slaCompliancePercentage) * 100) / 100),
+        registeredEnterprises: companies.length,
+        totalGrievances,
+        resolvedGrievances,
+        grievanceResolutionRate,
+        totalInvestmentPlans: investPlans.length,
+        totalProposedInvestmentCr
+      },
+      departmentsCount: deptsRes.data?.length || 0,
+      generatedAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }
+  /**
+   * 3. Department Analytics Aggregation (Zero PII)
+   */
+  async getDepartmentAnalytics() {
+    const [appsRes, deptsRes] = await Promise.all([
+      this.supabase.from("applications").select("id, department, status, sla_days, submitted_date, applied_date, approval_date, created_at"),
+      this.supabase.from("departments").select("id, name, code")
+    ]);
+    const apps = appsRes.data || [];
+    const depts = deptsRes.data || [];
+    const deptMap = /* @__PURE__ */ new Map();
+    depts.forEach((d) => {
+      deptMap.set(d.name, {
+        id: d.id,
+        name: d.name,
+        code: d.code,
+        totalApplications: 0,
+        approved: 0,
+        rejected: 0,
+        pending: 0,
+        totalDays: 0,
+        processedCount: 0,
+        slaCompliantCount: 0
+      });
+    });
+    apps.forEach((a) => {
+      const deptName = a.department || "Other";
+      if (!deptMap.has(deptName)) {
+        deptMap.set(deptName, {
+          id: `DEPT-${deptName.substring(0, 4).toUpperCase()}`,
+          name: deptName,
+          code: deptName.substring(0, 6).toUpperCase(),
+          totalApplications: 0,
+          approved: 0,
+          rejected: 0,
+          pending: 0,
+          totalDays: 0,
+          processedCount: 0,
+          slaCompliantCount: 0
+        });
+      }
+      const d = deptMap.get(deptName);
+      d.totalApplications++;
+      const st = (a.status || "").toLowerCase().trim();
+      const start = a.submitted_date || a.applied_date || a.created_at;
+      if (st === "approved") {
+        d.approved++;
+        if (a.approval_date && start) {
+          const diff = Math.max(0, Math.floor((new Date(a.approval_date).getTime() - new Date(start).getTime()) / (1e3 * 60 * 60 * 24)));
+          d.totalDays += diff;
+          d.processedCount++;
+          if (diff <= (Number(a.sla_days) || 21)) d.slaCompliantCount++;
+        } else {
+          d.slaCompliantCount++;
+        }
+      } else if (st === "rejected") {
+        d.rejected++;
+      } else {
+        d.pending++;
+        const sla = this.slaEngine.calculateSlaStatus(start, a.sla_days, a.status);
+        if (!sla.isBreached) d.slaCompliantCount++;
+      }
+    });
+    return Array.from(deptMap.values()).map((d) => ({
+      id: d.id,
+      name: d.name,
+      code: d.code,
+      applicationsCount: d.totalApplications,
+      approvedCount: d.approved,
+      rejectedCount: d.rejected,
+      pendingCount: d.pending,
+      avgProcessingDays: d.processedCount > 0 ? Math.round(d.totalDays / d.processedCount * 10) / 10 : 0,
+      slaComplianceRate: d.totalApplications > 0 ? Math.round(d.slaCompliantCount / d.totalApplications * 1e4) / 100 : 100
+    }));
+  }
+  /**
+   * 4. District Analytics Aggregation (Zero PII)
+   */
+  async getDistrictAnalytics() {
+    const [companiesRes, appsRes] = await Promise.all([
+      this.supabase.from("companies").select("id, district, sector, investment_crores"),
+      this.supabase.from("applications").select("id, company_id, status")
+    ]);
+    const companies = companiesRes.data || [];
+    const apps = appsRes.data || [];
+    const compToDist = /* @__PURE__ */ new Map();
+    companies.forEach((c) => {
+      compToDist.set(c.id, c.district || "Maharashtra");
+    });
+    const districtMap = /* @__PURE__ */ new Map();
+    companies.forEach((c) => {
+      const dist = c.district || "Maharashtra";
+      if (!districtMap.has(dist)) {
+        districtMap.set(dist, {
+          district: dist,
+          unitsCount: 0,
+          applicationsCount: 0,
+          approvedCount: 0,
+          pendingCount: 0,
+          proposedInvestmentCr: 0,
+          sectors: /* @__PURE__ */ new Set()
+        });
+      }
+      const item = districtMap.get(dist);
+      item.unitsCount++;
+      item.proposedInvestmentCr += Number(c.investment_crores) || 0;
+      if (c.sector) item.sectors.add(c.sector);
+    });
+    apps.forEach((a) => {
+      const dist = compToDist.get(a.company_id) || "Maharashtra";
+      if (!districtMap.has(dist)) {
+        districtMap.set(dist, {
+          district: dist,
+          unitsCount: 0,
+          applicationsCount: 0,
+          approvedCount: 0,
+          pendingCount: 0,
+          proposedInvestmentCr: 0,
+          sectors: /* @__PURE__ */ new Set()
+        });
+      }
+      const item = districtMap.get(dist);
+      item.applicationsCount++;
+      const st = (a.status || "").toLowerCase().trim();
+      if (st === "approved") item.approvedCount++;
+      else if (st !== "rejected") item.pendingCount++;
+    });
+    return Array.from(districtMap.values()).map((d) => ({
+      district: d.district,
+      unitsCount: d.unitsCount,
+      applicationsCount: d.applicationsCount,
+      approvedCount: d.approvedCount,
+      pendingCount: d.pendingCount,
+      proposedInvestmentCr: Math.round(d.proposedInvestmentCr * 100) / 100,
+      topSectors: Array.from(d.sectors)
+    }));
+  }
+  /**
+   * 5. Sector Analytics Aggregation (Zero PII)
+   */
+  async getSectorAnalytics() {
+    const [companiesRes, appsRes, investRes] = await Promise.all([
+      this.supabase.from("companies").select("id, sector, investment_crores"),
+      this.supabase.from("applications").select("id, company_id, status"),
+      this.supabase.from("invest_plans").select("id, industry_sector, investment_cr")
+    ]);
+    const companies = companiesRes.data || [];
+    const apps = appsRes.data || [];
+    const investPlans = investRes.data || [];
+    const compToSector = /* @__PURE__ */ new Map();
+    companies.forEach((c) => {
+      compToSector.set(c.id, c.sector || "General Manufacturing");
+    });
+    const sectorMap = /* @__PURE__ */ new Map();
+    const getSectorRecord = (secName) => {
+      const clean = secName || "General Manufacturing";
+      if (!sectorMap.has(clean)) {
+        sectorMap.set(clean, {
+          sector: clean,
+          enterprisesCount: 0,
+          applicationsCount: 0,
+          approvedCount: 0,
+          pendingCount: 0,
+          proposedInvestmentCr: 0
+        });
+      }
+      return sectorMap.get(clean);
+    };
+    companies.forEach((c) => {
+      const s = getSectorRecord(c.sector);
+      s.enterprisesCount++;
+      s.proposedInvestmentCr += Number(c.investment_crores) || 0;
+    });
+    apps.forEach((a) => {
+      const sec = compToSector.get(a.company_id) || "General Manufacturing";
+      const s = getSectorRecord(sec);
+      s.applicationsCount++;
+      const st = (a.status || "").toLowerCase().trim();
+      if (st === "approved") s.approvedCount++;
+      else if (st !== "rejected") s.pendingCount++;
+    });
+    investPlans.forEach((p) => {
+      const s = getSectorRecord(p.industry_sector);
+      s.proposedInvestmentCr += Number(p.investment_cr) || 0;
+    });
+    const totalApps = apps.length || 1;
+    return Array.from(sectorMap.values()).map((s) => ({
+      sector: s.sector,
+      enterprisesCount: s.enterprisesCount,
+      applicationsCount: s.applicationsCount,
+      approvedCount: s.approvedCount,
+      pendingCount: s.pendingCount,
+      proposedInvestmentCr: Math.round(s.proposedInvestmentCr * 100) / 100,
+      sharePercent: Math.round(s.applicationsCount / totalApps * 1e4) / 100
+    }));
+  }
+  /**
+   * 6. Grievance Analytics Aggregation (Zero PII)
+   */
+  async getGrievanceAnalytics() {
+    const { data: grievances } = await this.supabase.from("grievances").select("id, category, priority, status, sla_days, created_at, resolved_at");
+    const list = grievances || [];
+    const categoryMap = {};
+    const priorityMap = {};
+    const statusMap = {};
+    let totalResolvedDays = 0;
+    let resolvedCount = 0;
+    list.forEach((g) => {
+      const cat = g.category || "General / Other";
+      categoryMap[cat] = (categoryMap[cat] || 0) + 1;
+      const prio = g.priority || "Medium";
+      priorityMap[prio] = (priorityMap[prio] || 0) + 1;
+      const st = g.status || "submitted";
+      statusMap[st] = (statusMap[st] || 0) + 1;
+      if ((st === "resolved" || st === "closed") && g.resolved_at && g.created_at) {
+        const days = Math.max(0, Math.floor((new Date(g.resolved_at).getTime() - new Date(g.created_at).getTime()) / (1e3 * 60 * 60 * 24)));
+        totalResolvedDays += days;
+        resolvedCount++;
+      }
+    });
+    return {
+      totalGrievances: list.length,
+      categories: categoryMap,
+      priorities: priorityMap,
+      statuses: statusMap,
+      avgResolutionDays: resolvedCount > 0 ? Math.round(totalResolvedDays / resolvedCount * 10) / 10 : 0,
+      resolutionRate: list.length > 0 ? Math.round(((statusMap["resolved"] || 0) + (statusMap["closed"] || 0)) / list.length * 1e4) / 100 : 0
+    };
+  }
+  /**
+   * 7. Generate CSV Data String for Export
+   */
+  generateCsv(headers, rows) {
+    const escapeVal = (val) => {
+      if (val === null || val === void 0) return '""';
+      const str = String(val).replace(/"/g, '""');
+      return `"${str}"`;
+    };
+    const headerLine = headers.map(escapeVal).join(",");
+    const bodyLines = rows.map((r) => r.map(escapeVal).join(","));
+    return [headerLine, ...bodyLines].join("\n");
+  }
+};
+
+// server.ts
 dotenv.config();
-
-const currentFilename = typeof __filename !== "undefined" ? __filename : (typeof import.meta !== "undefined" && import.meta.url ? fileURLToPath(import.meta.url) : process.cwd());
-const currentDirname = typeof __dirname !== "undefined" ? __dirname : path.dirname(currentFilename);
-
-export const app = express();
-const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
-const SESSION_SECRET = process.env.SESSION_SECRET || "mahau-secure-jwt-session-secret-2026-industry-bridge";
-
-// 1. Security Headers Middleware (Production-hardened, SPA & Vite compatible)
-app.use((req: Request, res: Response, next: NextFunction) => {
+var currentFilename = typeof __filename !== "undefined" ? __filename : typeof import.meta !== "undefined" && import.meta.url ? fileURLToPath(import.meta.url) : process.cwd();
+var currentDirname = typeof __dirname !== "undefined" ? __dirname : path.dirname(currentFilename);
+var app = express();
+var PORT = process.env.PORT ? parseInt(process.env.PORT) : 3e3;
+var SESSION_SECRET = process.env.SESSION_SECRET || "mahau-secure-jwt-session-secret-2026-industry-bridge";
+app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("X-XSS-Protection", "1; mode=block");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
-  // Remove sensitive fingerprinting headers
   res.removeHeader("X-Powered-By");
-
-  // Universal CORS Policy (Enables multi-server, cross-device, and external API integrations)
   const origin = req.headers.origin;
   if (origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -39,28 +1528,17 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   }
   res.setHeader("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-company-token, ngrok-skip-browser-warning, *");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
-
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
   }
-
   next();
 });
-
-// 2. In-memory Lightweight Rate Limiter (Protects sensitive endpoints against brute force & DoS)
-interface RateLimitRecord {
-  count: number;
-  resetTime: number;
-}
-const rateLimitMap = new Map<string, RateLimitRecord>();
-
-export function createRateLimiter(options: { windowMs: number; max: number; message?: string }) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    // Skip rate limiting in automated test runners unless explicitly testing rate limits
+var rateLimitMap = /* @__PURE__ */ new Map();
+function createRateLimiter(options) {
+  return (req, res, next) => {
     if (process.env.NODE_ENV === "test" && !req.headers["x-test-rate-limit"]) {
       return next();
     }
-
     let ip = "127.0.0.1";
     try {
       const forwardedFor = req.headers["x-forwarded-for"];
@@ -74,10 +1552,8 @@ export function createRateLimiter(options: { windowMs: number; max: number; mess
     } catch {
       ip = "127.0.0.1";
     }
-
     const key = `${req.path}:${ip}`;
     const now = Date.now();
-
     let record = rateLimitMap.get(key);
     if (!record || now > record.resetTime) {
       record = { count: 1, resetTime: now + options.windowMs };
@@ -85,29 +1561,23 @@ export function createRateLimiter(options: { windowMs: number; max: number; mess
     } else {
       record.count++;
     }
-
     try {
       res.setHeader("X-RateLimit-Limit", options.max);
       res.setHeader("X-RateLimit-Remaining", Math.max(0, options.max - record.count));
-      res.setHeader("X-RateLimit-Reset", Math.ceil(record.resetTime / 1000));
-    } catch {}
-
+      res.setHeader("X-RateLimit-Reset", Math.ceil(record.resetTime / 1e3));
+    } catch {
+    }
     if (record.count > options.max) {
       return res.status(429).json({
         error: options.message || "Too many requests. Please wait and try again later."
       });
     }
-
     next();
   };
 }
-
-// 3. Body parser with strict payload size limits
 app.use(express.json({ limit: "15mb" }));
-
-// 3.5. Universal URL normalizer for Vercel Serverless / multi-environment hosting
-app.use((req: Request, _res: Response, next: NextFunction) => {
-  const matchedPath = (req.headers["x-matched-path"] as string) || (req.headers["x-invoke-path"] as string);
+app.use((req, _res, next) => {
+  const matchedPath = req.headers["x-matched-path"] || req.headers["x-invoke-path"];
   if (matchedPath && matchedPath.startsWith("/api") && req.url !== matchedPath) {
     req.url = matchedPath;
   } else if (!req.url.startsWith("/api") && !req.url.startsWith("/assets") && req.url !== "/favicon.ico") {
@@ -115,59 +1585,49 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
   }
   next();
 });
-
-// Root API & Health Endpoints
-app.get("/api", (_req: Request, res: Response) => {
+app.get("/api", (_req, res) => {
   res.json({
     status: "ok",
     service: "MahaUdyogSetu API",
     version: "1.0.0",
-    timestamp: new Date().toISOString()
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
   });
 });
-
-app.get("/api/health", (_req: Request, res: Response) => {
+app.get("/api/health", (_req, res) => {
   res.json({
     status: "healthy",
     service: "MahaUdyogSetu API",
-    timestamp: new Date().toISOString()
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
   });
 });
-
-// Initialize Supabase Client (Backend)
-const supabaseUrl = process.env.SUPABASE_URL || "https://iiqdnregrpeocsghmrtv.supabase.co";
-const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || "sb_publishable_LYopuHWIc3vRNbxzVj82kA_vhEUxYGk";
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
-const slaEngine = new SlaAndNotificationEngine(supabase);
-const dashboardEngine = new DashboardAndAnalyticsEngine(supabase, slaEngine);
-
-// Initialize Twilio Client
-let twilioClient: any = null;
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
-
+var supabaseUrl = process.env.SUPABASE_URL || "https://iiqdnregrpeocsghmrtv.supabase.co";
+var supabaseAnonKey = process.env.SUPABASE_ANON_KEY || "sb_publishable_LYopuHWIc3vRNbxzVj82kA_vhEUxYGk";
+var supabase = createClient(supabaseUrl, supabaseAnonKey);
+var slaEngine = new SlaAndNotificationEngine(supabase);
+var dashboardEngine = new DashboardAndAnalyticsEngine(supabase, slaEngine);
+var twilioClient = null;
+var TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+var TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+var TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
 if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
   try {
-    twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+    twilioClient = twilio2(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
     console.log("Twilio SMS Client initialized.");
   } catch (err) {
     console.warn("Twilio Client initialization notice:", err);
   }
 }
-
-// Initialize Google Gen AI
-let aiClient: GoogleGenAI | null = null;
-function getAIClient(): GoogleGenAI | null {
+var aiClient = null;
+function getAIClient() {
   if (!aiClient && process.env.GEMINI_API_KEY) {
     try {
       aiClient = new GoogleGenAI({
         apiKey: process.env.GEMINI_API_KEY,
         httpOptions: {
           headers: {
-            "User-Agent": "aistudio-build",
-          },
-        },
+            "User-Agent": "aistudio-build"
+          }
+        }
       });
     } catch (e) {
       console.warn("Failed to initialize Gemini AI client:", e);
@@ -175,24 +1635,12 @@ function getAIClient(): GoogleGenAI | null {
   }
   return aiClient;
 }
-
-// =========================================================================
-// SECURITY, PASSWORD HASHING & SESSION TOKEN UTILITIES
-// =========================================================================
-
-/**
- * Hash password securely using Node crypto scrypt with random salt
- */
-export function hashPassword(password: string): string {
+function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
   const derivedKey = crypto.scryptSync(password, salt, 64);
   return `${salt}:${derivedKey.toString("hex")}`;
 }
-
-/**
- * Verify password against stored scrypt hash or legacy benchmark
- */
-export function verifyPassword(password: string, combinedHash?: string | null): boolean {
+function verifyPassword(password, combinedHash) {
   if (!password || !combinedHash) return false;
   const parts = combinedHash.split(":");
   if (parts.length !== 2) {
@@ -203,11 +1651,7 @@ export function verifyPassword(password: string, combinedHash?: string | null): 
   const derivedKey = crypto.scryptSync(password, salt, 64);
   return crypto.timingSafeEqual(keyBuffer, derivedKey);
 }
-
-/**
- * Generate HMAC-SHA256 authenticated session token (supports optional role e.g. REGULATORY_ADMIN)
- */
-export function generateSessionToken(companyId: string, email?: string, role: string = "COMPANY_USER"): string {
+function generateSessionToken(companyId, email, role = "COMPANY_USER") {
   const cleanId = String(companyId || "").trim();
   const cleanRole = String(role || "COMPANY_USER").trim();
   const payload = {
@@ -215,33 +1659,25 @@ export function generateSessionToken(companyId: string, email?: string, role: st
     email: email ? String(email).trim().toLowerCase() : "",
     role: cleanRole,
     issuedAt: Date.now(),
-    expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 // 7 days validity
+    expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1e3
+    // 7 days validity
   };
   const data = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const signature = crypto.createHmac("sha256", SESSION_SECRET).update(data).digest("base64url");
   return `${data}.${signature}`;
 }
-
-/**
- * Verify HMAC-SHA256 session token with timing-safe signature comparison and payload validation
- */
-export function verifySessionToken(token?: string | null): { companyId: string; email?: string; role?: string } | null {
+function verifySessionToken(token) {
   if (!token || typeof token !== "string" || !token.includes(".")) return null;
   const parts = token.trim().split(".");
   if (parts.length !== 2) return null;
-
   const [data, signature] = parts;
   if (!data || !signature) return null;
-
   const expectedSig = crypto.createHmac("sha256", SESSION_SECRET).update(data).digest("base64url");
-  
-  // Timing-safe comparison to prevent timing attacks
   const sigBuffer = Buffer.from(signature);
   const expectedBuffer = Buffer.from(expectedSig);
   if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {
     return null;
   }
-
   try {
     const payload = JSON.parse(Buffer.from(data, "base64url").toString("utf8"));
     if (!payload || typeof payload !== "object") return null;
@@ -252,27 +1688,9 @@ export function verifySessionToken(token?: string | null): { companyId: string; 
     return null;
   }
 }
-
-// In-memory OTP Store for verification
-const otpStore = new Map<string, { otp: string; expiresAt: number; profile: any }>();
-
-// In-memory Registered Companies Store for instant verification and testing
-export const registeredCompaniesMap = new Map<string, any>();
-
-
-
-// Default benchmark company ID
-const DEFAULT_COMPANY_ID = "BIZ-MH-FGHIJ-001";
-
-
-// =========================================================================
-// DATA CONVERSION & VALIDATION HELPERS
-// =========================================================================
-
-/**
- * Convert Database PostgreSQL row to frontend-compatible BusinessProfile object
- */
-export function dbToBusinessProfile(row: any): any {
+var otpStore = /* @__PURE__ */ new Map();
+var registeredCompaniesMap = /* @__PURE__ */ new Map();
+function dbToBusinessProfile(row) {
   if (!row) return null;
   return {
     id: row.id,
@@ -319,23 +1737,16 @@ export function dbToBusinessProfile(row: any): any {
     updatedAt: row.updated_at
   };
 }
-
-/**
- * Convert Database PostgreSQL row to frontend-compatible ApprovalItem object
- */
-export function dbToApprovalItem(row: any): any {
+function dbToApprovalItem(row) {
   if (!row) return null;
-
-  // Dynamic SLA Elapsed Calculation based on submitted/applied date
   let calculatedDaysElapsed = Number(row.days_elapsed) || 0;
   const startTimestamp = row.submitted_date || row.applied_date;
   if (startTimestamp) {
     const startDate = new Date(startTimestamp).getTime();
     if (!isNaN(startDate)) {
-      calculatedDaysElapsed = Math.max(0, Math.floor((Date.now() - startDate) / (1000 * 60 * 60 * 24)));
+      calculatedDaysElapsed = Math.max(0, Math.floor((Date.now() - startDate) / (1e3 * 60 * 60 * 24)));
     }
   }
-
   return {
     id: row.id,
     code: row.code || row.id,
@@ -349,17 +1760,17 @@ export function dbToApprovalItem(row: any): any {
     status: row.status || "not_started",
     requiredDocs: Array.isArray(row.required_docs) ? row.required_docs : [],
     submittedDocs: Array.isArray(row.submitted_docs) ? row.submitted_docs : [],
-    submittedDate: row.submitted_date ? new Date(row.submitted_date).toISOString() : undefined,
-    appliedDate: row.applied_date ? new Date(row.applied_date).toISOString() : undefined,
+    submittedDate: row.submitted_date ? new Date(row.submitted_date).toISOString() : void 0,
+    appliedDate: row.applied_date ? new Date(row.applied_date).toISOString() : void 0,
     paymentStatus: row.payment_status || "pending",
-    paymentMode: row.payment_mode || undefined,
-    transactionId: row.transaction_id || undefined,
+    paymentMode: row.payment_mode || void 0,
+    transactionId: row.transaction_id || void 0,
     applicationRefNumber: row.code || row.id,
-    approvalDate: row.approval_date ? new Date(row.approval_date).toISOString() : undefined,
-    certificateNumber: row.certificate_number || undefined,
-    validityExpiry: row.validity_expiry ? new Date(row.validity_expiry).toISOString() : undefined,
+    approvalDate: row.approval_date ? new Date(row.approval_date).toISOString() : void 0,
+    certificateNumber: row.certificate_number || void 0,
+    validityExpiry: row.validity_expiry ? new Date(row.validity_expiry).toISOString() : void 0,
     queries: Array.isArray(row.queries) ? row.queries : [],
-    inspection: row.inspection && typeof row.inspection === "object" && Object.keys(row.inspection).length > 0 ? row.inspection : undefined,
+    inspection: row.inspection && typeof row.inspection === "object" && Object.keys(row.inspection).length > 0 ? row.inspection : void 0,
     feeAmount: Number(row.fee_amount) || 0,
     stageName: row.stage_name || "Pre-Establishment",
     statusHistory: Array.isArray(row.status_history) ? row.status_history : [],
@@ -368,50 +1779,40 @@ export function dbToApprovalItem(row: any): any {
     updatedAt: row.updated_at
   };
 }
-
-/**
- * Convert frontend ApprovalItem to Database PostgreSQL columns
- */
-export function approvalItemToDb(item: any, companyId: string): Record<string, any> {
-  const dbRecord: Record<string, any> = {
+function approvalItemToDb(item, companyId) {
+  const dbRecord = {
     company_id: companyId,
-    updated_at: new Date().toISOString()
+    updated_at: (/* @__PURE__ */ new Date()).toISOString()
   };
-
-  if (item.id !== undefined) dbRecord.id = item.id;
-  if (item.code !== undefined) dbRecord.code = item.code;
-  if (item.name !== undefined) dbRecord.name = item.name;
-  if (item.department !== undefined) dbRecord.department = item.department;
-  if (item.category !== undefined) dbRecord.category = item.category;
-  if (item.slaDays !== undefined) dbRecord.sla_days = Number(item.slaDays);
-  if (item.daysElapsed !== undefined) dbRecord.days_elapsed = Number(item.daysElapsed);
-  if (item.riskTier !== undefined) dbRecord.risk_tier = item.riskTier;
-  if (item.fastTrack !== undefined) dbRecord.fast_track = Boolean(item.fastTrack);
-  if (item.status !== undefined) dbRecord.status = item.status;
-  if (item.requiredDocs !== undefined) dbRecord.required_docs = item.requiredDocs;
-  if (item.submittedDocs !== undefined) dbRecord.submitted_docs = item.submittedDocs;
-  if (item.submittedDate !== undefined) dbRecord.submitted_date = item.submittedDate ? new Date(item.submittedDate).toISOString() : null;
-  if (item.appliedDate !== undefined) dbRecord.applied_date = item.appliedDate ? new Date(item.appliedDate).toISOString() : null;
-  if (item.approvalDate !== undefined) dbRecord.approval_date = item.approvalDate ? new Date(item.approvalDate).toISOString() : null;
-  if (item.certificateNumber !== undefined) dbRecord.certificate_number = item.certificateNumber;
-  if (item.validityExpiry !== undefined) dbRecord.validity_expiry = item.validityExpiry ? new Date(item.validityExpiry).toISOString() : null;
-  if (item.paymentStatus !== undefined) dbRecord.payment_status = item.paymentStatus;
-  if (item.paymentMode !== undefined) dbRecord.payment_mode = item.paymentMode;
-  if (item.transactionId !== undefined) dbRecord.transaction_id = item.transactionId;
-  if (item.feeAmount !== undefined) dbRecord.fee_amount = Number(item.feeAmount);
-  if (item.stageName !== undefined) dbRecord.stage_name = item.stageName;
-  if (item.queries !== undefined) dbRecord.queries = item.queries;
-  if (item.inspection !== undefined) dbRecord.inspection = item.inspection;
-  if (item.statusHistory !== undefined) dbRecord.status_history = item.statusHistory;
-  if (item.verifiedDocDetails !== undefined) dbRecord.verified_doc_details = item.verifiedDocDetails;
-
+  if (item.id !== void 0) dbRecord.id = item.id;
+  if (item.code !== void 0) dbRecord.code = item.code;
+  if (item.name !== void 0) dbRecord.name = item.name;
+  if (item.department !== void 0) dbRecord.department = item.department;
+  if (item.category !== void 0) dbRecord.category = item.category;
+  if (item.slaDays !== void 0) dbRecord.sla_days = Number(item.slaDays);
+  if (item.daysElapsed !== void 0) dbRecord.days_elapsed = Number(item.daysElapsed);
+  if (item.riskTier !== void 0) dbRecord.risk_tier = item.riskTier;
+  if (item.fastTrack !== void 0) dbRecord.fast_track = Boolean(item.fastTrack);
+  if (item.status !== void 0) dbRecord.status = item.status;
+  if (item.requiredDocs !== void 0) dbRecord.required_docs = item.requiredDocs;
+  if (item.submittedDocs !== void 0) dbRecord.submitted_docs = item.submittedDocs;
+  if (item.submittedDate !== void 0) dbRecord.submitted_date = item.submittedDate ? new Date(item.submittedDate).toISOString() : null;
+  if (item.appliedDate !== void 0) dbRecord.applied_date = item.appliedDate ? new Date(item.appliedDate).toISOString() : null;
+  if (item.approvalDate !== void 0) dbRecord.approval_date = item.approvalDate ? new Date(item.approvalDate).toISOString() : null;
+  if (item.certificateNumber !== void 0) dbRecord.certificate_number = item.certificateNumber;
+  if (item.validityExpiry !== void 0) dbRecord.validity_expiry = item.validityExpiry ? new Date(item.validityExpiry).toISOString() : null;
+  if (item.paymentStatus !== void 0) dbRecord.payment_status = item.paymentStatus;
+  if (item.paymentMode !== void 0) dbRecord.payment_mode = item.paymentMode;
+  if (item.transactionId !== void 0) dbRecord.transaction_id = item.transactionId;
+  if (item.feeAmount !== void 0) dbRecord.fee_amount = Number(item.feeAmount);
+  if (item.stageName !== void 0) dbRecord.stage_name = item.stageName;
+  if (item.queries !== void 0) dbRecord.queries = item.queries;
+  if (item.inspection !== void 0) dbRecord.inspection = item.inspection;
+  if (item.statusHistory !== void 0) dbRecord.status_history = item.statusHistory;
+  if (item.verifiedDocDetails !== void 0) dbRecord.verified_doc_details = item.verifiedDocDetails;
   return dbRecord;
 }
-
-/**
- * Benchmark Seed Approvals for Initial Account Hydration
- */
-export const BENCHMARK_SEED_APPROVALS = [
+var BENCHMARK_SEED_APPROVALS = [
   {
     id: "APP-PCB-01",
     code: "CTE-AIR-WATER",
@@ -424,7 +1825,7 @@ export const BENCHMARK_SEED_APPROVALS = [
     fast_track: true,
     status: "under_scrutiny",
     stage_name: "Regional Officer Technical Scrutiny (Nashik)",
-    fee_amount: 25000,
+    fee_amount: 25e3,
     required_docs: [
       "Certificate of Incorporation & Company PAN Card",
       "Ambad MIDC Industrial Plot Allotment Letter & Lease Deed",
@@ -492,7 +1893,7 @@ export const BENCHMARK_SEED_APPROVALS = [
     fast_track: true,
     status: "query_raised",
     stage_name: "Awaiting Applicant Query Clarification",
-    fee_amount: 15000,
+    fee_amount: 15e3,
     required_docs: [
       "Comprehensive Factory Architectural & Site Layout Plan",
       "Ambad MIDC Industrial Plot Allotment Letter & Lease Deed",
@@ -545,7 +1946,7 @@ export const BENCHMARK_SEED_APPROVALS = [
     fast_track: true,
     status: "approved",
     stage_name: "Sanction Order Executed & Dispatched",
-    fee_amount: 35000,
+    fee_amount: 35e3,
     required_docs: [
       "Certificate of Incorporation & Company PAN Card",
       "Ambad MIDC Industrial Plot Allotment Letter & Lease Deed",
@@ -638,7 +2039,7 @@ export const BENCHMARK_SEED_APPROVALS = [
     fast_track: true,
     status: "under_scrutiny",
     stage_name: "Green-Channel Deemed Scrutiny",
-    fee_amount: 22000,
+    fee_amount: 22e3,
     required_docs: [
       "Ambad MIDC Industrial Plot Allotment Letter & Lease Deed",
       "Certificate of Incorporation & Company PAN Card"
@@ -667,42 +2068,25 @@ export const BENCHMARK_SEED_APPROVALS = [
     ]
   }
 ];
-
-/**
- * Helper to seed initial benchmark applications if company table has 0 applications
- */
-export async function seedDefaultApplicationsIfEmpty(companyId: string) {
+async function seedDefaultApplicationsIfEmpty(companyId) {
   try {
-    const { data: existingApps, error: checkErr } = await supabase
-      .from("applications")
-      .select("id")
-      .eq("company_id", companyId)
-      .limit(1);
-
-    if (checkErr || (existingApps && existingApps.length > 0)) {
+    const { data: existingApps, error: checkErr } = await supabase.from("applications").select("id").eq("company_id", companyId).limit(1);
+    if (checkErr || existingApps && existingApps.length > 0) {
       return;
     }
-
-    // Seed default applications
-    const rowsToInsert = BENCHMARK_SEED_APPROVALS.map((app) => ({
-      ...app,
+    const rowsToInsert = BENCHMARK_SEED_APPROVALS.map((app2) => ({
+      ...app2,
       company_id: companyId,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     }));
-
     await supabase.from("applications").upsert(rowsToInsert);
   } catch (seedErr) {
     console.warn("Application seed notice:", seedErr);
   }
 }
-
-/**
- * Sanitize filename to prevent path traversal, illicit control characters, or directory injections
- */
-export function sanitizeFilename(filename: string): string {
+function sanitizeFilename(filename) {
   if (!filename) return "document.pdf";
-  // Remove directory traversal sequences (../, ..\, etc.)
   let clean = filename.replace(/\.\.+[/\\]+/g, "").replace(/[/\\?%*:|"<>]/g, "_");
   clean = clean.replace(/[^\w.\- ]/g, "_").trim();
   if (!clean || clean === "." || clean.startsWith(".")) {
@@ -710,24 +2094,13 @@ export function sanitizeFilename(filename: string): string {
   }
   return clean;
 }
-
-/**
- * Validate Document File (10 MB Limit, Supported PDF/JPEG/PNG formats, Non-empty)
- */
-export function validateDocumentFile(
-  fileData: any,
-  fileName?: string,
-  fileType?: string
-): { valid: boolean; error?: string; buffer?: Buffer; mimeType?: string; safeFilename?: string; sizeMB?: string } {
+function validateDocumentFile(fileData, fileName, fileType) {
   if (!fileData) {
     return { valid: false, error: "No file content provided for upload." };
   }
-
-  let buffer: Buffer;
+  let buffer;
   let detectedMime = fileType || "application/pdf";
-
   if (typeof fileData === "string") {
-    // Check if Data URL format: data:<mime>;base64,<encoded>
     if (fileData.startsWith("data:")) {
       const match = fileData.match(/^data:([^;]+);base64,(.+)$/);
       if (match) {
@@ -753,13 +2126,9 @@ export function validateDocumentFile(
   } else {
     return { valid: false, error: "Invalid file format supplied." };
   }
-
-  // Reject empty file
   if (!buffer || buffer.length === 0) {
     return { valid: false, error: "Cannot upload an empty file (0 bytes)." };
   }
-
-  // Check 10 MB limit (10 * 1024 * 1024 bytes = 10485760 bytes)
   const MAX_BYTES = 10 * 1024 * 1024;
   if (buffer.length > MAX_BYTES) {
     return {
@@ -767,16 +2136,11 @@ export function validateDocumentFile(
       error: `File size (${(buffer.length / (1024 * 1024)).toFixed(1)} MB) exceeds the 10 MB maximum allowed limit.`
     };
   }
-
-  // Determine and validate extension / MIME
   const rawName = fileName || "document.pdf";
   const ext = path.extname(rawName).toLowerCase().replace(".", "");
   const safeFilename = sanitizeFilename(rawName);
-
   const allowedExtensions = ["pdf", "jpg", "jpeg", "png"];
   const allowedMimes = ["application/pdf", "image/jpeg", "image/jpg", "image/png"];
-
-  // Normalize MIME
   if (ext === "pdf" && (!detectedMime || detectedMime === "application/octet-stream")) {
     detectedMime = "application/pdf";
   } else if ((ext === "jpg" || ext === "jpeg") && (!detectedMime || detectedMime === "application/octet-stream")) {
@@ -784,19 +2148,15 @@ export function validateDocumentFile(
   } else if (ext === "png" && (!detectedMime || detectedMime === "application/octet-stream")) {
     detectedMime = "image/png";
   }
-
   const isExtAllowed = allowedExtensions.includes(ext);
   const isMimeAllowed = allowedMimes.includes(detectedMime.toLowerCase());
-
   if (!isExtAllowed || !isMimeAllowed) {
     return {
       valid: false,
       error: "Unsupported file type. Only PDF (.pdf), JPEG (.jpg, .jpeg), and PNG (.png) files are permitted in the Document Vault."
     };
   }
-
   const sizeMB = `${(buffer.length / (1024 * 1024)).toFixed(1)} MB`;
-
   return {
     valid: true,
     buffer,
@@ -805,74 +2165,58 @@ export function validateDocumentFile(
     sizeMB
   };
 }
-
-/**
- * Convert Database PostgreSQL row to frontend-compatible DocumentItem object
- */
-export function dbToDocumentItem(row: any): any {
+function dbToDocumentItem(row) {
   if (!row) return null;
   return {
     id: row.id,
     name: row.name,
-    type: row.file_type?.includes("pdf") ? "PDF" : (row.file_type?.includes("image") ? "IMAGE" : row.file_type || "PDF"),
+    type: row.file_type?.includes("pdf") ? "PDF" : row.file_type?.includes("image") ? "IMAGE" : row.file_type || "PDF",
     category: row.category || "Company / Identity",
     fileSize: row.file_size || "1.0 MB",
-    uploadDate: row.uploaded_at
-      ? new Date(row.uploaded_at).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
-      : new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }),
-    expiryDate: row.expiry_date ? new Date(row.expiry_date).toISOString() : undefined,
+    uploadDate: row.uploaded_at ? new Date(row.uploaded_at).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) : (/* @__PURE__ */ new Date()).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }),
+    expiryDate: row.expiry_date ? new Date(row.expiry_date).toISOString() : void 0,
     status: row.status || "pending",
     validationScore: Number(row.validation_score) || 0,
     checklistResults: Array.isArray(row.checklist_results) ? row.checklist_results : [],
     missingOrInvalidItems: Array.isArray(row.missing_or_invalid_items) ? row.missing_or_invalid_items : [],
-    correctionGuidance: row.correction_guidance || undefined,
+    correctionGuidance: row.correction_guidance || void 0,
     linkedApprovals: Array.isArray(row.linked_approvals) ? row.linked_approvals : [],
     usedBy: Array.isArray(row.used_by) ? row.used_by : [],
-    applicationId: row.application_id || undefined,
-    storagePath: row.storage_path || undefined,
-    verifiedAt: row.verified_at ? new Date(row.verified_at).toISOString() : undefined,
+    applicationId: row.application_id || void 0,
+    storagePath: row.storage_path || void 0,
+    verifiedAt: row.verified_at ? new Date(row.verified_at).toISOString() : void 0,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
 }
-
-/**
- * Convert frontend DocumentItem to Database PostgreSQL columns
- */
-export function documentItemToDb(item: any, companyId: string): Record<string, any> {
-  const dbRecord: Record<string, any> = {
+function documentItemToDb(item, companyId) {
+  const dbRecord = {
     company_id: companyId,
-    updated_at: new Date().toISOString()
+    updated_at: (/* @__PURE__ */ new Date()).toISOString()
   };
-
-  if (item.id !== undefined) dbRecord.id = item.id;
-  if (item.applicationId !== undefined) dbRecord.application_id = item.applicationId || null;
-  if (item.name !== undefined) dbRecord.name = item.name;
-  if (item.fileType !== undefined) dbRecord.file_type = item.fileType;
-  if (item.type !== undefined && !item.fileType) {
+  if (item.id !== void 0) dbRecord.id = item.id;
+  if (item.applicationId !== void 0) dbRecord.application_id = item.applicationId || null;
+  if (item.name !== void 0) dbRecord.name = item.name;
+  if (item.fileType !== void 0) dbRecord.file_type = item.fileType;
+  if (item.type !== void 0 && !item.fileType) {
     dbRecord.file_type = item.type === "PDF" ? "application/pdf" : item.type;
   }
-  if (item.fileSize !== undefined) dbRecord.file_size = item.fileSize;
-  if (item.storagePath !== undefined) dbRecord.storage_path = item.storagePath;
-  if (item.category !== undefined) dbRecord.category = item.category;
-  if (item.status !== undefined) dbRecord.status = item.status;
-  if (item.validationScore !== undefined) dbRecord.validation_score = Number(item.validationScore);
-  if (item.checklistResults !== undefined) dbRecord.checklist_results = item.checklistResults;
-  if (item.missingOrInvalidItems !== undefined) dbRecord.missing_or_invalid_items = item.missingOrInvalidItems;
-  if (item.correctionGuidance !== undefined) dbRecord.correction_guidance = item.correctionGuidance;
-  if (item.linkedApprovals !== undefined) dbRecord.linked_approvals = item.linkedApprovals;
-  if (item.usedBy !== undefined) dbRecord.used_by = item.usedBy;
-  if (item.verifiedAt !== undefined) dbRecord.verified_at = item.verifiedAt ? new Date(item.verifiedAt).toISOString() : null;
-  if (item.verifiedBy !== undefined) dbRecord.verified_by = item.verifiedBy;
-  if (item.expiryDate !== undefined) dbRecord.expiry_date = item.expiryDate ? new Date(item.expiryDate).toISOString() : null;
-
+  if (item.fileSize !== void 0) dbRecord.file_size = item.fileSize;
+  if (item.storagePath !== void 0) dbRecord.storage_path = item.storagePath;
+  if (item.category !== void 0) dbRecord.category = item.category;
+  if (item.status !== void 0) dbRecord.status = item.status;
+  if (item.validationScore !== void 0) dbRecord.validation_score = Number(item.validationScore);
+  if (item.checklistResults !== void 0) dbRecord.checklist_results = item.checklistResults;
+  if (item.missingOrInvalidItems !== void 0) dbRecord.missing_or_invalid_items = item.missingOrInvalidItems;
+  if (item.correctionGuidance !== void 0) dbRecord.correction_guidance = item.correctionGuidance;
+  if (item.linkedApprovals !== void 0) dbRecord.linked_approvals = item.linkedApprovals;
+  if (item.usedBy !== void 0) dbRecord.used_by = item.usedBy;
+  if (item.verifiedAt !== void 0) dbRecord.verified_at = item.verifiedAt ? new Date(item.verifiedAt).toISOString() : null;
+  if (item.verifiedBy !== void 0) dbRecord.verified_by = item.verifiedBy;
+  if (item.expiryDate !== void 0) dbRecord.expiry_date = item.expiryDate ? new Date(item.expiryDate).toISOString() : null;
   return dbRecord;
 }
-
-/**
- * Allowed Statutory Grievance Categories & Priorities
- */
-export const ALLOWED_GRIEVANCE_CATEGORIES = [
+var ALLOWED_GRIEVANCE_CATEGORIES = [
   "Application Delay",
   "Rejection",
   "Document Issue",
@@ -887,8 +2231,7 @@ export const ALLOWED_GRIEVANCE_CATEGORIES = [
   "Technical Query",
   "Procedural Query"
 ];
-
-export const ALLOWED_GRIEVANCE_PRIORITIES = [
+var ALLOWED_GRIEVANCE_PRIORITIES = [
   "Normal",
   "Important",
   "Urgent",
@@ -897,11 +2240,7 @@ export const ALLOWED_GRIEVANCE_PRIORITIES = [
   "High",
   "Critical"
 ];
-
-/**
- * Benchmark Seed Grievances for Initial Hydration
- */
-export const BENCHMARK_SEED_GRIEVANCES = [
+var BENCHMARK_SEED_GRIEVANCES = [
   {
     id: "MGV-2026-102458",
     type: "grievance",
@@ -1003,39 +2342,24 @@ export const BENCHMARK_SEED_GRIEVANCES = [
     ]
   }
 ];
-
-/**
- * Seed initial benchmark grievances for company if empty
- */
-export async function seedDefaultGrievancesIfEmpty(companyId: string) {
+async function seedDefaultGrievancesIfEmpty(companyId) {
   try {
-    const { data: existing, error: checkErr } = await supabase
-      .from("grievances")
-      .select("id")
-      .eq("company_id", companyId)
-      .limit(1);
-
-    if (checkErr || (existing && existing.length > 0)) {
+    const { data: existing, error: checkErr } = await supabase.from("grievances").select("id").eq("company_id", companyId).limit(1);
+    if (checkErr || existing && existing.length > 0) {
       return;
     }
-
     const rowsToInsert = BENCHMARK_SEED_GRIEVANCES.map((grv) => ({
       ...grv,
       company_id: companyId,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     }));
-
     await supabase.from("grievances").upsert(rowsToInsert);
   } catch (seedErr) {
     console.warn("Grievance seed notice:", seedErr);
   }
 }
-
-/**
- * Convert Database PostgreSQL row to frontend-compatible GrievanceRecord object
- */
-export function dbToGrievanceRecord(row: any): any {
+function dbToGrievanceRecord(row) {
   if (!row) return null;
   return {
     id: row.id,
@@ -1044,13 +2368,13 @@ export function dbToGrievanceRecord(row: any): any {
     applicantName: row.applicant_name || "",
     mobile: row.mobile || "",
     email: row.email || "",
-    applicationNumber: row.application_number || row.application_id || undefined,
-    applicationId: row.application_id || undefined,
+    applicationNumber: row.application_number || row.application_id || void 0,
+    applicationId: row.application_id || void 0,
     serviceType: row.service_type || "",
     department: row.department || "",
     district: row.district || "",
     taluka: row.taluka || "",
-    midcArea: row.midc_area || undefined,
+    midcArea: row.midc_area || void 0,
     category: row.category || "Other",
     priority: row.priority || "Normal",
     subject: row.subject || "",
@@ -1059,80 +2383,62 @@ export function dbToGrievanceRecord(row: any): any {
     notifySms: Boolean(row.notify_sms !== false),
     notifyEmail: Boolean(row.notify_email !== false),
     notifyPortal: Boolean(row.notify_portal !== false),
-    submittedDate: row.submitted_date ? new Date(row.submitted_date).toLocaleString("en-GB") : new Date().toLocaleString("en-GB"),
-    lastUpdated: row.last_updated ? new Date(row.last_updated).toLocaleString("en-GB") : new Date().toLocaleString("en-GB"),
+    submittedDate: row.submitted_date ? new Date(row.submitted_date).toLocaleString("en-GB") : (/* @__PURE__ */ new Date()).toLocaleString("en-GB"),
+    lastUpdated: row.last_updated ? new Date(row.last_updated).toLocaleString("en-GB") : (/* @__PURE__ */ new Date()).toLocaleString("en-GB"),
     status: row.status || "Submitted",
-    assignedOfficer: row.assigned_officer || undefined,
-    departmentResponse: row.department_response || undefined,
+    assignedOfficer: row.assigned_officer || void 0,
+    departmentResponse: row.department_response || void 0,
     expectedSlaDays: Number(row.expected_sla_days) || 7,
-    rtsEscalationLevel: row.rts_escalation_level || undefined,
-    resolutionDate: row.resolution_date ? new Date(row.resolution_date).toLocaleString("en-GB") : undefined,
+    rtsEscalationLevel: row.rts_escalation_level || void 0,
+    resolutionDate: row.resolution_date ? new Date(row.resolution_date).toLocaleString("en-GB") : void 0,
     statusHistory: Array.isArray(row.status_history) ? row.status_history : [],
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
 }
-
-/**
- * Convert frontend GrievanceRecord to Database PostgreSQL columns
- */
-export function grievanceRecordToDb(item: any, companyId: string): Record<string, any> {
-  const dbRecord: Record<string, any> = {
+function grievanceRecordToDb(item, companyId) {
+  const dbRecord = {
     company_id: companyId,
-    updated_at: new Date().toISOString(),
-    last_updated: new Date().toISOString()
+    updated_at: (/* @__PURE__ */ new Date()).toISOString(),
+    last_updated: (/* @__PURE__ */ new Date()).toISOString()
   };
-
-  if (item.id !== undefined) dbRecord.id = item.id;
-  if (item.type !== undefined) dbRecord.type = item.type;
-  if (item.applicationId !== undefined) dbRecord.application_id = item.applicationId || null;
-  if (item.applicationNumber !== undefined) dbRecord.application_number = item.applicationNumber || null;
-  if (item.businessName !== undefined) dbRecord.business_name = item.businessName;
-  if (item.applicantName !== undefined) dbRecord.applicant_name = item.applicantName;
-  if (item.mobile !== undefined) dbRecord.mobile = item.mobile;
-  if (item.email !== undefined) dbRecord.email = item.email;
-  if (item.serviceType !== undefined) dbRecord.service_type = item.serviceType;
-  if (item.department !== undefined) dbRecord.department = item.department;
-  if (item.district !== undefined) dbRecord.district = item.district;
-  if (item.taluka !== undefined) dbRecord.taluka = item.taluka;
-  if (item.midcArea !== undefined) dbRecord.midc_area = item.midcArea;
-  if (item.category !== undefined) dbRecord.category = item.category;
-  if (item.priority !== undefined) dbRecord.priority = item.priority;
-  if (item.subject !== undefined) dbRecord.subject = item.subject;
-  if (item.description !== undefined) dbRecord.description = item.description;
-  if (item.documents !== undefined) dbRecord.documents = item.documents;
-  if (item.notifySms !== undefined) dbRecord.notify_sms = Boolean(item.notifySms);
-  if (item.notifyEmail !== undefined) dbRecord.notify_email = Boolean(item.notifyEmail);
-  if (item.notifyPortal !== undefined) dbRecord.notify_portal = Boolean(item.notifyPortal);
-  if (item.status !== undefined) dbRecord.status = item.status;
-  if (item.expectedSlaDays !== undefined) dbRecord.expected_sla_days = Number(item.expectedSlaDays);
-  if (item.rtsEscalationLevel !== undefined) dbRecord.rts_escalation_level = item.rtsEscalationLevel;
-  if (item.submittedDate !== undefined) dbRecord.submitted_date = item.submittedDate ? new Date(item.submittedDate).toISOString() : null;
-  if (item.statusHistory !== undefined) dbRecord.status_history = item.statusHistory;
-
+  if (item.id !== void 0) dbRecord.id = item.id;
+  if (item.type !== void 0) dbRecord.type = item.type;
+  if (item.applicationId !== void 0) dbRecord.application_id = item.applicationId || null;
+  if (item.applicationNumber !== void 0) dbRecord.application_number = item.applicationNumber || null;
+  if (item.businessName !== void 0) dbRecord.business_name = item.businessName;
+  if (item.applicantName !== void 0) dbRecord.applicant_name = item.applicantName;
+  if (item.mobile !== void 0) dbRecord.mobile = item.mobile;
+  if (item.email !== void 0) dbRecord.email = item.email;
+  if (item.serviceType !== void 0) dbRecord.service_type = item.serviceType;
+  if (item.department !== void 0) dbRecord.department = item.department;
+  if (item.district !== void 0) dbRecord.district = item.district;
+  if (item.taluka !== void 0) dbRecord.taluka = item.taluka;
+  if (item.midcArea !== void 0) dbRecord.midc_area = item.midcArea;
+  if (item.category !== void 0) dbRecord.category = item.category;
+  if (item.priority !== void 0) dbRecord.priority = item.priority;
+  if (item.subject !== void 0) dbRecord.subject = item.subject;
+  if (item.description !== void 0) dbRecord.description = item.description;
+  if (item.documents !== void 0) dbRecord.documents = item.documents;
+  if (item.notifySms !== void 0) dbRecord.notify_sms = Boolean(item.notifySms);
+  if (item.notifyEmail !== void 0) dbRecord.notify_email = Boolean(item.notifyEmail);
+  if (item.notifyPortal !== void 0) dbRecord.notify_portal = Boolean(item.notifyPortal);
+  if (item.status !== void 0) dbRecord.status = item.status;
+  if (item.expectedSlaDays !== void 0) dbRecord.expected_sla_days = Number(item.expectedSlaDays);
+  if (item.rtsEscalationLevel !== void 0) dbRecord.rts_escalation_level = item.rtsEscalationLevel;
+  if (item.submittedDate !== void 0) dbRecord.submitted_date = item.submittedDate ? new Date(item.submittedDate).toISOString() : null;
+  if (item.statusHistory !== void 0) dbRecord.status_history = item.statusHistory;
   return dbRecord;
 }
-
-/**
- * Validate PAN format
- */
-export function isValidPAN(pan?: string): boolean {
+function isValidPAN(pan) {
   if (!pan) return false;
   return /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/i.test(pan.trim());
 }
-
-/**
- * Validate GSTIN format
- */
-export function isValidGSTIN(gstin?: string): boolean {
+function isValidGSTIN(gstin) {
   if (!gstin) return false;
   return /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/i.test(gstin.trim());
 }
-
-/**
- * Allowed Feedback Types & Modules
- */
-export const ALLOWED_FEEDBACK_TYPES = [
+var ALLOWED_FEEDBACK_TYPES = [
   "Overall Experience",
   "Application Process",
   "Document Verification",
@@ -1142,8 +2448,7 @@ export const ALLOWED_FEEDBACK_TYPES = [
   "Technical Issue",
   "Other"
 ];
-
-export const ALLOWED_FEEDBACK_MODULES = [
+var ALLOWED_FEEDBACK_MODULES = [
   "Applications",
   "Services Provided",
   "Document Repository",
@@ -1155,11 +2460,7 @@ export const ALLOWED_FEEDBACK_MODULES = [
   "Permission Verification",
   "Other"
 ];
-
-/**
- * Benchmark Seed Feedback Records
- */
-export const BENCHMARK_SEED_FEEDBACK = [
+var BENCHMARK_SEED_FEEDBACK = [
   {
     id: "MUS-FB-2026-000124",
     feedback_type: "Application Process",
@@ -1207,39 +2508,24 @@ export const BENCHMARK_SEED_FEEDBACK = [
     updated_at: "2026-09-25T08:30:00.000Z"
   }
 ];
-
-/**
- * Seed benchmark feedback if company has no feedback
- */
-export async function seedDefaultFeedbackIfEmpty(companyId: string) {
+async function seedDefaultFeedbackIfEmpty(companyId) {
   try {
-    const { data: existing, error: checkErr } = await supabase
-      .from("feedback")
-      .select("id")
-      .eq("company_id", companyId)
-      .limit(1);
-
-    if (checkErr || (existing && existing.length > 0)) {
+    const { data: existing, error: checkErr } = await supabase.from("feedback").select("id").eq("company_id", companyId).limit(1);
+    if (checkErr || existing && existing.length > 0) {
       return;
     }
-
     const rowsToInsert = BENCHMARK_SEED_FEEDBACK.map((fb) => ({
       ...fb,
       company_id: companyId,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     }));
-
     await supabase.from("feedback").upsert(rowsToInsert);
   } catch (seedErr) {
     console.warn("Feedback seed notice:", seedErr);
   }
 }
-
-/**
- * Convert Database PostgreSQL row to frontend-compatible FeedbackRecord object
- */
-export function dbToFeedbackRecord(row: any): any {
+function dbToFeedbackRecord(row) {
   if (!row) return null;
   return {
     id: row.id,
@@ -1249,15 +2535,15 @@ export function dbToFeedbackRecord(row: any): any {
       year: "numeric",
       hour: "2-digit",
       minute: "2-digit"
-    }) : new Date().toLocaleDateString("en-GB"),
+    }) : (/* @__PURE__ */ new Date()).toLocaleDateString("en-GB"),
     feedbackType: row.feedback_type || "Overall Experience",
     relatedModule: row.related_module || "Applications",
     rating: Number(row.rating) || 5,
     message: row.message || "",
-    applicationRef: row.application_ref || undefined,
-    name: row.name || undefined,
-    mobile: row.mobile || undefined,
-    email: row.email || undefined,
+    applicationRef: row.application_ref || void 0,
+    name: row.name || void 0,
+    mobile: row.mobile || void 0,
+    email: row.email || void 0,
     status: row.status || "Submitted",
     responseDate: row.response_date ? new Date(row.response_date).toLocaleDateString("en-GB", {
       day: "2-digit",
@@ -1265,18 +2551,14 @@ export function dbToFeedbackRecord(row: any): any {
       year: "numeric",
       hour: "2-digit",
       minute: "2-digit"
-    }) : undefined,
-    departmentResponse: row.department_response || undefined,
+    }) : void 0,
+    departmentResponse: row.department_response || void 0,
     replies: Array.isArray(row.replies) ? row.replies : [],
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
 }
-
-/**
- * Benchmark Seed Investment Plan
- */
-export const BENCHMARK_SEED_INVEST_PLAN = {
+var BENCHMARK_SEED_INVEST_PLAN = {
   id: "MUS-INV-2026-000001",
   project_name: "Western Precision Engineering Expansion Unit",
   industry_sector: "Engineering & Heavy Manufacturing",
@@ -1350,44 +2632,29 @@ export const BENCHMARK_SEED_INVEST_PLAN = {
     }
   ],
   calculated_results: {
-    disclaimer: "Indicative Information — Verify latest requirements with the relevant official authority.",
+    disclaimer: "Indicative Information \u2014 Verify latest requirements with the relevant official authority.",
     preliminaryGuidance: true
   }
 };
-
-/**
- * Seed benchmark investment plan if company has no plans
- */
-export async function seedDefaultInvestPlanIfEmpty(companyId: string) {
+async function seedDefaultInvestPlanIfEmpty(companyId) {
   try {
-    const { data: existing, error: checkErr } = await supabase
-      .from("invest_plans")
-      .select("id")
-      .eq("company_id", companyId)
-      .limit(1);
-
-    if (checkErr || (existing && existing.length > 0)) {
+    const { data: existing, error: checkErr } = await supabase.from("invest_plans").select("id").eq("company_id", companyId).limit(1);
+    if (checkErr || existing && existing.length > 0) {
       return;
     }
-
     const rowToInsert = {
       ...BENCHMARK_SEED_INVEST_PLAN,
       company_id: companyId,
-      last_updated: new Date().toISOString(),
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      last_updated: (/* @__PURE__ */ new Date()).toISOString(),
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     };
-
     await supabase.from("invest_plans").upsert([rowToInsert]);
   } catch (seedErr) {
     console.warn("Invest plan seed notice:", seedErr);
   }
 }
-
-/**
- * Convert Database PostgreSQL row to frontend-compatible InvestmentPlan object
- */
-export function dbToInvestPlan(row: any): any {
+function dbToInvestPlan(row) {
   if (!row) return null;
   return {
     id: row.id,
@@ -1398,39 +2665,19 @@ export function dbToInvestPlan(row: any): any {
     status: row.status || "active",
     items: Array.isArray(row.items) ? row.items : [],
     calculatedResults: row.calculated_results || {},
-    lastUpdated: row.last_updated ? new Date(row.last_updated).toLocaleDateString("en-GB") : new Date().toLocaleDateString("en-GB"),
+    lastUpdated: row.last_updated ? new Date(row.last_updated).toLocaleDateString("en-GB") : (/* @__PURE__ */ new Date()).toLocaleDateString("en-GB"),
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
 }
-
-/**
- * Validate 10-digit mobile number
- */
-export function isValidMobile(mobile?: string): boolean {
+function isValidMobile(mobile) {
   if (!mobile) return false;
   const digits = mobile.replace(/\D/g, "");
   return digits.length === 10;
 }
-
-// Extend Request interface for TypeScript
-declare global {
-  namespace Express {
-    interface Request {
-      authenticatedCompanyId?: string;
-      authenticatedEmail?: string;
-      authenticatedRole?: string;
-    }
-  }
-}
-
-/**
- * Reusable Authentication Middleware for company data access
- */
-export function requireCompanyAuth(req: Request, res: Response, next: NextFunction) {
-  const authHeader = req.headers.authorization || (req.headers["x-company-token"] as string);
-  let token: string | null = null;
-
+function requireCompanyAuth(req, res, next) {
+  const authHeader = req.headers.authorization || req.headers["x-company-token"];
+  let token = null;
   if (authHeader) {
     if (authHeader.startsWith("Bearer ")) {
       token = authHeader.slice(7).trim();
@@ -1438,37 +2685,26 @@ export function requireCompanyAuth(req: Request, res: Response, next: NextFuncti
       token = authHeader.trim();
     }
   }
-
-  // If no token or invalid signature, deny request
   const verified = verifySessionToken(token);
   if (!verified || !verified.companyId) {
     return res.status(401).json({
       error: "Authentication required. Please provide a valid authorization token."
     });
   }
-
   req.authenticatedCompanyId = verified.companyId;
   req.authenticatedEmail = verified.email;
   req.authenticatedRole = verified.role || "COMPANY_USER";
-
-  // Cross-tenant access prevention: If client explicitly requests a companyId via query/body, enforce matching
-  const requestedCompanyId = (req.query.companyId as string) || (req.query.company_id as string) || req.body.companyId || req.body.company_id;
+  const requestedCompanyId = req.query.companyId || req.query.company_id || req.body.companyId || req.body.company_id;
   if (requestedCompanyId && requestedCompanyId !== req.authenticatedCompanyId) {
     return res.status(403).json({
       error: "Access denied: cannot access or modify data belonging to another enterprise."
     });
   }
-
   next();
 }
-
-/**
- * Strict Server-Side Authorization Middleware for Regulatory Administrators (Step 9)
- */
-export function requireRegulatoryAdmin(req: Request, res: Response, next: NextFunction) {
-  const authHeader = req.headers.authorization || (req.headers["x-company-token"] as string);
-  let token: string | null = null;
-
+function requireRegulatoryAdmin(req, res, next) {
+  const authHeader = req.headers.authorization || req.headers["x-company-token"];
+  let token = null;
   if (authHeader) {
     if (authHeader.startsWith("Bearer ")) {
       token = authHeader.slice(7).trim();
@@ -1476,39 +2712,27 @@ export function requireRegulatoryAdmin(req: Request, res: Response, next: NextFu
       token = authHeader.trim();
     }
   }
-
   if (!token) {
     return res.status(401).json({
       error: "Authentication required. Administrative access token is missing."
     });
   }
-
   const verified = verifySessionToken(token);
   if (!verified) {
     return res.status(401).json({
       error: "Authentication failed. Invalid or expired administrative session token."
     });
   }
-
-  // Server-side role check: only REGULATORY_ADMIN or SUPER_ADMIN role allowed
   if (verified.role !== "REGULATORY_ADMIN" && verified.role !== "SUPER_ADMIN") {
     return res.status(403).json({
       error: "Access forbidden: Regulatory administrator privileges (REGULATORY_ADMIN) required for this operation."
     });
   }
-
   req.authenticatedCompanyId = verified.companyId;
   req.authenticatedEmail = verified.email;
   req.authenticatedRole = verified.role;
-
   next();
 }
-
-// =========================================================================
-// API ENDPOINTS
-// =========================================================================
-
-// 1. Health check & Supabase Connection Status
 app.get("/api/health", async (_req, res) => {
   let supabaseStatus = "connected";
   try {
@@ -1516,10 +2740,9 @@ app.get("/api/health", async (_req, res) => {
     if (error && error.code !== "PGRST116" && error.code !== "42P01") {
       supabaseStatus = `notice: ${error.message}`;
     }
-  } catch (err: any) {
+  } catch (err) {
     supabaseStatus = `offline: ${err.message}`;
   }
-
   res.json({
     status: "ok",
     hasApiKey: !!process.env.GEMINI_API_KEY,
@@ -1529,26 +2752,19 @@ app.get("/api/health", async (_req, res) => {
       projectRef: process.env.SUPABASE_PROJECT_REF || "iiqdnregrpeocsghmrtv"
     },
     twilioConfigured: !!twilioClient,
-    timestamp: new Date().toISOString(),
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
   });
 });
-
-
-
-// 2. Send Registration OTP via Twilio SMS (or simulated carrier) - Relaxed for multi-device testing
-app.post("/api/auth/send-otp", createRateLimiter({ windowMs: 60 * 1000, max: 100, message: "Too many OTP requests. Please wait 1 minute." }), async (req, res) => {
+app.post("/api/auth/send-otp", createRateLimiter({ windowMs: 60 * 1e3, max: 100, message: "Too many OTP requests. Please wait 1 minute." }), async (req, res) => {
   try {
     const { mobile, email, companyName, profile } = req.body;
     if (!mobile) {
       return res.status(400).json({ error: "Mobile number is required for verification." });
     }
-
     const cleanMobile = mobile.replace(/\D/g, "").slice(-10);
     if (cleanMobile.length !== 10) {
       return res.status(400).json({ error: "Please provide a valid 10-digit mobile number." });
     }
-
-    // Check if email or mobile is already registered in Supabase
     if (email) {
       try {
         const { data: existingEmail } = await supabase.from("companies").select("id, name, email").eq("email", email.trim().toLowerCase()).maybeSingle();
@@ -1557,9 +2773,9 @@ app.post("/api/auth/send-otp", createRateLimiter({ windowMs: 60 * 1000, max: 100
             error: `An enterprise account is already registered with email address ${email}. Please login with your password.`
           });
         }
-      } catch (e) {}
+      } catch (e) {
+      }
     }
-
     try {
       const { data: existingMobile } = await supabase.from("companies").select("id, name, mobile").eq("mobile", cleanMobile).maybeSingle();
       if (existingMobile && process.env.NODE_ENV === "production" && !process.env.ALLOW_REG_RETRY) {
@@ -1567,37 +2783,31 @@ app.post("/api/auth/send-otp", createRateLimiter({ windowMs: 60 * 1000, max: 100
           error: `An enterprise account is already registered with mobile number +91 ${cleanMobile}. Please login with your password.`
         });
       }
-    } catch (e) {}
-
-    // Generate random 6-digit secure OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    } catch (e) {
+    }
+    const otp = Math.floor(1e5 + Math.random() * 9e5).toString();
     const formattedMobile = `+91${cleanMobile}`;
-
-    // Store in OTP map (valid for 10 minutes)
     otpStore.set(cleanMobile, {
       otp,
-      expiresAt: Date.now() + 10 * 60 * 1000,
+      expiresAt: Date.now() + 10 * 60 * 1e3,
       profile: profile || {}
     });
-
     let twilioSent = false;
-
     if (twilioClient && TWILIO_PHONE_NUMBER) {
       try {
         await twilioClient.messages.create({
           body: `MahaUdyogSetu: Your official Single Window registration OTP is ${otp}. Valid for 10 minutes. Do not share this with anyone.`,
           from: TWILIO_PHONE_NUMBER,
-          to: formattedMobile,
+          to: formattedMobile
         });
         twilioSent = true;
         console.log(`[Twilio SMS] Sent OTP to ${formattedMobile}`);
-      } catch (smsErr: any) {
+      } catch (smsErr) {
         console.warn(`[Twilio Error]: ${smsErr?.message}`);
       }
     } else {
       console.log(`[SMS Gateway] Generated OTP ${otp} for ${formattedMobile}. (Twilio credentials not configured in .env - test mode active).`);
     }
-
     res.json({
       success: true,
       message: `OTP sent successfully to ${formattedMobile}`,
@@ -1605,29 +2815,22 @@ app.post("/api/auth/send-otp", createRateLimiter({ windowMs: 60 * 1000, max: 100
       deliveredViaTwilio: twilioSent,
       expiresInSeconds: 600
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to send OTP" });
   }
 });
-
-/**
- * Helper to register an enterprise account in Supabase & memory cache with secure password hashing
- */
-async function registerEnterpriseAccount(data: any) {
+async function registerEnterpriseAccount(data) {
   const pan = (data.pan || "").toUpperCase().trim();
   const cin = (data.cin || "").toUpperCase().trim();
   const gstin = (data.gstin || "").toUpperCase().trim();
   const email = (data.email || "").toLowerCase().trim();
   const cleanMobile = (data.mobile || "").replace(/\D/g, "").slice(-10);
-
   const companyName = data.companyName || data.name || "Registered Enterprise";
   const userPassword = data.password || "Password@123";
   if (userPassword.length < 6) {
     throw new Error("Password must be at least 6 characters long.");
   }
-
-  // Check if company already exists by PAN / CIN / GSTIN
-  let existingCompany: any = null;
+  let existingCompany = null;
   if (pan) {
     const { data: byPan } = await supabase.from("companies").select("*").eq("pan", pan).maybeSingle();
     if (byPan) existingCompany = byPan;
@@ -1640,17 +2843,11 @@ async function registerEnterpriseAccount(data: any) {
     const { data: byGstin } = await supabase.from("companies").select("*").eq("gstin", gstin).maybeSingle();
     if (byGstin) existingCompany = byGstin;
   }
-
-  const companyId = existingCompany?.id || data.companyId || data.id || `BIZ-MH-${pan ? pan.slice(0, 5) : 'ENT'}-${Math.floor(100 + Math.random() * 900)}`;
+  const companyId = existingCompany?.id || data.companyId || data.id || `BIZ-MH-${pan ? pan.slice(0, 5) : "ENT"}-${Math.floor(100 + Math.random() * 900)}`;
   const passwordHash = hashPassword(userPassword);
-
   const isComplete = Boolean(
-    data.sector && 
-    (data.investmentCrores || data.investment_crores) && 
-    (data.connectedPowerKw || data.connected_power_kw) && 
-    data.workforce
+    data.sector && (data.investmentCrores || data.investment_crores) && (data.connectedPowerKw || data.connected_power_kw) && data.workforce
   );
-
   const companyDbRecord = {
     id: companyId,
     name: companyName,
@@ -1659,52 +2856,39 @@ async function registerEnterpriseAccount(data: any) {
     pan: pan || "ABCDE1234F",
     gstin: gstin || "27ABCDE1234F1Z5",
     mobile: cleanMobile,
-    email: email,
+    email,
     password_hash: passwordHash,
     state: data.state || "Maharashtra",
     district: data.district || "Nashik",
     taluka: data.taluka || "Ambad",
     address: data.address || "MIDC Industrial Area, Maharashtra",
     sector: data.sector || "Engineering & Heavy Manufacturing",
-    scale: data.scale || (Number(data.investmentCrores) > 50 ? "Large" : (Number(data.investmentCrores) > 10 ? "Medium" : "Small")),
-    investment_crores: Number(data.investmentCrores || data.investment_crores) || 10.0,
+    scale: data.scale || (Number(data.investmentCrores) > 50 ? "Large" : Number(data.investmentCrores) > 10 ? "Medium" : "Small"),
+    investment_crores: Number(data.investmentCrores || data.investment_crores) || 10,
     workforce: Number(data.workforce) || 50,
     connected_power_kw: Number(data.powerKw || data.connectedPowerKw || data.connected_power_kw) || 150,
     handles_hazardous: Boolean(data.handlesHazardous || data.handles_hazardous),
     land_type: data.landType || data.land_type || "Industrial Park (Allotted)",
     stage: data.stage || "Pre-Establishment",
     is_profile_complete: isComplete,
-    updated_at: new Date().toISOString()
+    updated_at: (/* @__PURE__ */ new Date()).toISOString()
   };
-
-  // Upsert into Supabase public.companies
-  const { data: savedData, error: dbError } = await supabase
-    .from("companies")
-    .upsert(companyDbRecord)
-    .select()
-    .single();
-
+  const { data: savedData, error: dbError } = await supabase.from("companies").upsert(companyDbRecord).select().single();
   if (dbError) {
     console.warn("Supabase upsert note during registration:", dbError.message);
   }
-
-  // Store in in-memory cache for immediate authentication verification
   if (cleanMobile) registeredCompaniesMap.set(cleanMobile, companyDbRecord);
   if (email) registeredCompaniesMap.set(email.toLowerCase(), companyDbRecord);
   if (cin) registeredCompaniesMap.set(cin.toUpperCase(), companyDbRecord);
-
   const finalProfile = dbToBusinessProfile(savedData || companyDbRecord);
   const token = generateSessionToken(companyId, finalProfile.email);
-
   return {
     token,
     companyId,
     profile: finalProfile
   };
 }
-
-// 2. Direct Enterprise Registration (Secure Password-Based)
-app.post("/api/auth/register", createRateLimiter({ windowMs: 60 * 1000, max: 100, message: "Too many registration attempts. Please wait 1 minute." }), async (req, res) => {
+app.post("/api/auth/register", createRateLimiter({ windowMs: 60 * 1e3, max: 100, message: "Too many registration attempts. Please wait 1 minute." }), async (req, res) => {
   try {
     const { companyName, email, mobile, password } = req.body;
     if (!companyName && !req.body.name) {
@@ -1716,7 +2900,6 @@ app.post("/api/auth/register", createRateLimiter({ windowMs: 60 * 1000, max: 100
     if (password && password.length < 6) {
       return res.status(400).json({ error: "Password must be at least 6 characters long." });
     }
-
     const result = await registerEnterpriseAccount(req.body);
     res.json({
       success: true,
@@ -1725,31 +2908,25 @@ app.post("/api/auth/register", createRateLimiter({ windowMs: 60 * 1000, max: 100
       companyId: result.companyId,
       profile: result.profile
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Registration failed" });
   }
 });
-
-// 3. Verify OTP / Registration Fallback (Persists Company to Supabase)
-app.post("/api/auth/verify-otp", createRateLimiter({ windowMs: 60 * 1000, max: 100, message: "Too many verification attempts. Please wait 1 minute." }), async (req, res) => {
+app.post("/api/auth/verify-otp", createRateLimiter({ windowMs: 60 * 1e3, max: 100, message: "Too many verification attempts. Please wait 1 minute." }), async (req, res) => {
   try {
     const { mobile, otp, profile } = req.body;
     const cleanMobile = (mobile || "").replace(/\D/g, "").slice(-10);
-
     const storedRecord = otpStore.get(cleanMobile);
     const enteredOtp = (otp || "").trim();
     if (!enteredOtp) {
       return res.status(400).json({ error: "Please enter any OTP code to proceed." });
     }
-
     const fullProfileData = profile || storedRecord?.profile || {};
     if (cleanMobile && !fullProfileData.mobile) {
       fullProfileData.mobile = cleanMobile;
     }
-
     const result = await registerEnterpriseAccount(fullProfileData);
     otpStore.delete(cleanMobile);
-
     res.json({
       success: true,
       message: "Authentication verified and enterprise profile registered successfully.",
@@ -1757,17 +2934,13 @@ app.post("/api/auth/verify-otp", createRateLimiter({ windowMs: 60 * 1000, max: 1
       companyId: result.companyId,
       profile: result.profile
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Verification failed" });
   }
 });
-
-// 4. Authentication & Company Login (Verifies Credentials + Scrypt Hash)
-app.post("/api/auth/login", createRateLimiter({ windowMs: 60 * 1000, max: 100, message: "Too many login attempts. Please wait 1 minute." }), async (req, res) => {
+app.post("/api/auth/login", createRateLimiter({ windowMs: 60 * 1e3, max: 100, message: "Too many login attempts. Please wait 1 minute." }), async (req, res) => {
   try {
     const { companyName, cin, mobile, email, password } = req.body;
-
-    // Validate Login Credentials
     const rawIdentifier = (email || mobile || cin || companyName || "").trim();
     if (!rawIdentifier) {
       return res.status(400).json({ error: "Please enter your registered email, mobile, or CIN." });
@@ -1775,15 +2948,11 @@ app.post("/api/auth/login", createRateLimiter({ windowMs: 60 * 1000, max: 100, m
     if (!password) {
       return res.status(400).json({ error: "Please enter your account password." });
     }
-
-    // Flexible identifier check: could be email, 10-digit phone, CIN, or company name
     const rawDigits = rawIdentifier.replace(/\D/g, "").slice(-10);
     const isMobileFormat = rawDigits.length === 10 && !rawIdentifier.includes("@");
-    const cleanMobile = mobile ? mobile.replace(/\D/g, "").slice(-10) : (isMobileFormat ? rawDigits : "");
-    const cleanEmail = rawIdentifier.includes("@") ? rawIdentifier.toLowerCase() : (email ? email.trim().toLowerCase() : "");
+    const cleanMobile = mobile ? mobile.replace(/\D/g, "").slice(-10) : isMobileFormat ? rawDigits : "";
+    const cleanEmail = rawIdentifier.includes("@") ? rawIdentifier.toLowerCase() : email ? email.trim().toLowerCase() : "";
     const cleanCin = (cin || (!rawIdentifier.includes("@") && !isMobileFormat ? rawIdentifier : "")).toUpperCase();
-
-    // Check in-memory registered users first
     let matchedCompany = null;
     if (cleanEmail && registeredCompaniesMap.has(cleanEmail)) {
       matchedCompany = registeredCompaniesMap.get(cleanEmail);
@@ -1792,8 +2961,6 @@ app.post("/api/auth/login", createRateLimiter({ windowMs: 60 * 1000, max: 100, m
     } else if (cleanCin && registeredCompaniesMap.has(cleanCin)) {
       matchedCompany = registeredCompaniesMap.get(cleanCin);
     }
-
-    // Check Supabase if not found in memory
     if (!matchedCompany) {
       if (cleanMobile) {
         const { data: byMobile } = await supabase.from("companies").select("*").eq("mobile", cleanMobile).limit(1);
@@ -1812,39 +2979,32 @@ app.post("/api/auth/login", createRateLimiter({ windowMs: 60 * 1000, max: 100, m
         if (byName && byName.length > 0) matchedCompany = byName[0];
       }
     }
-
     if (!matchedCompany) {
       return res.status(401).json({
         error: "No registered enterprise found with these credentials. Please check your credentials or register as a new user."
       });
     }
-
-    // Verify Password Hash using scrypt
     const isPasswordValid = verifyPassword(password, matchedCompany.password_hash);
     if (!isPasswordValid) {
       return res.status(401).json({
         error: "Incorrect password entered. Please enter the password you registered with."
       });
     }
-
     const cleanProfile = dbToBusinessProfile(matchedCompany);
     const token = generateSessionToken(matchedCompany.id, cleanProfile.email);
-
     res.json({
       success: true,
       message: `Authentication successful. Welcome, ${cleanProfile.name}!`,
       token,
       profile: cleanProfile
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Login failed" });
   }
 });
-
-// 4.5. GET /api/auth/me - Validate current session token & return profile
 app.get("/api/auth/me", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { data, error } = await supabase.from("companies").select("*").eq("id", companyId).maybeSingle();
     if (error || !data) {
       return res.status(404).json({ error: "Company profile not found." });
@@ -1854,46 +3014,32 @@ app.get("/api/auth/me", requireCompanyAuth, async (req, res) => {
       companyId,
       profile: dbToBusinessProfile(data)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: "Failed to verify session" });
   }
 });
-
-// 5. Get Authenticated Company Profile (Protected by requireCompanyAuth)
 app.get("/api/company/profile", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
-
-    const { data, error } = await supabase
-      .from("companies")
-      .select("*")
-      .eq("id", companyId)
-      .maybeSingle();
-
+    const companyId = req.authenticatedCompanyId;
+    const { data, error } = await supabase.from("companies").select("*").eq("id", companyId).maybeSingle();
     if (error) {
       return res.status(500).json({ error: "Failed to retrieve company profile from database." });
     }
-
     if (!data) {
       return res.status(404).json({ error: "Company profile not found in database." });
     }
-
     const profile = dbToBusinessProfile(data);
     res.json({
       success: true,
       profile
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Error fetching profile" });
   }
 });
-
-// 6. Update Authenticated Company Profile (Protected by requireCompanyAuth)
 app.put("/api/company/profile", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
-
-    // Validation
+    const companyId = req.authenticatedCompanyId;
     if (req.body.pan && !isValidPAN(req.body.pan)) {
       return res.status(400).json({ error: "Invalid PAN format. Expected format: 5 letters, 4 digits, 1 letter (e.g. ABCDE1234F)." });
     }
@@ -1903,106 +3049,80 @@ app.put("/api/company/profile", requireCompanyAuth, async (req, res) => {
     if (req.body.mobile && !isValidMobile(req.body.mobile)) {
       return res.status(400).json({ error: "Invalid mobile number. Expected 10 digits." });
     }
-    if (req.body.investmentCrores !== undefined && Number(req.body.investmentCrores) < 0) {
+    if (req.body.investmentCrores !== void 0 && Number(req.body.investmentCrores) < 0) {
       return res.status(400).json({ error: "Investment amount cannot be negative." });
     }
-    if (req.body.workforce !== undefined && (!Number.isInteger(Number(req.body.workforce)) || Number(req.body.workforce) < 0)) {
+    if (req.body.workforce !== void 0 && (!Number.isInteger(Number(req.body.workforce)) || Number(req.body.workforce) < 0)) {
       return res.status(400).json({ error: "Workforce must be a non-negative whole number." });
     }
-    if (req.body.connectedPowerKw !== undefined && Number(req.body.connectedPowerKw) < 0) {
+    if (req.body.connectedPowerKw !== void 0 && Number(req.body.connectedPowerKw) < 0) {
       return res.status(400).json({ error: "Connected power load cannot be negative." });
     }
-
-    // Fetch existing profile
-    const { data: existing, error: fetchErr } = await supabase
-      .from("companies")
-      .select("*")
-      .eq("id", companyId)
-      .maybeSingle();
-
+    const { data: existing, error: fetchErr } = await supabase.from("companies").select("*").eq("id", companyId).maybeSingle();
     if (fetchErr || !existing) {
       return res.status(404).json({ error: "Company profile not found to update." });
     }
-
-    const updatedDbPayload: Record<string, any> = {
-      updated_at: new Date().toISOString()
+    const updatedDbPayload = {
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     };
-
-    if (req.body.name !== undefined) updatedDbPayload.name = req.body.name;
-    if (req.body.businessType !== undefined) updatedDbPayload.business_type = req.body.businessType;
-    if (req.body.cin !== undefined) updatedDbPayload.cin = req.body.cin;
-    if (req.body.pan !== undefined) updatedDbPayload.pan = req.body.pan.toUpperCase().trim();
-    if (req.body.gstin !== undefined) updatedDbPayload.gstin = req.body.gstin.toUpperCase().trim();
-    if (req.body.udyamRegistration !== undefined) updatedDbPayload.udyam_registration = req.body.udyamRegistration;
-    if (req.body.authorizedPersonName !== undefined) updatedDbPayload.authorized_person_name = req.body.authorizedPersonName;
-    if (req.body.authorizedPersonDesignation !== undefined) updatedDbPayload.authorized_person_designation = req.body.authorizedPersonDesignation;
-    if (req.body.mobile !== undefined) updatedDbPayload.mobile = req.body.mobile.replace(/\D/g, "").slice(-10);
-    if (req.body.email !== undefined) updatedDbPayload.email = req.body.email;
-    if (req.body.sector !== undefined) updatedDbPayload.sector = req.body.sector;
-    if (req.body.activityDescription !== undefined) updatedDbPayload.activity_description = req.body.activityDescription;
-    if (req.body.state !== undefined) updatedDbPayload.state = req.body.state;
-    if (req.body.district !== undefined) updatedDbPayload.district = req.body.district;
-    if (req.body.taluka !== undefined) updatedDbPayload.taluka = req.body.taluka;
-    if (req.body.village !== undefined) updatedDbPayload.village = req.body.village;
-    if (req.body.plotNumber !== undefined) updatedDbPayload.plot_number = req.body.plotNumber;
-    if (req.body.pincode !== undefined) updatedDbPayload.pincode = req.body.pincode;
-    if (req.body.address !== undefined) updatedDbPayload.address = req.body.address;
-    if (req.body.scale !== undefined) updatedDbPayload.scale = req.body.scale;
-    if (req.body.investmentCrores !== undefined) updatedDbPayload.investment_crores = Number(req.body.investmentCrores);
-    if (req.body.builtUpAreaSqFt !== undefined) updatedDbPayload.built_up_area_sq_ft = Number(req.body.builtUpAreaSqFt);
-    if (req.body.workforce !== undefined) updatedDbPayload.workforce = Number(req.body.workforce);
-    if (req.body.contractWorkersCount !== undefined) updatedDbPayload.contract_workers_count = Number(req.body.contractWorkersCount);
-    if (req.body.connectedPowerKw !== undefined) updatedDbPayload.connected_power_kw = Number(req.body.connectedPowerKw);
-    if (req.body.isMIDC !== undefined) updatedDbPayload.is_midc = Boolean(req.body.isMIDC);
-    if (req.body.handlesHazardous !== undefined) updatedDbPayload.handles_hazardous = Boolean(req.body.handlesHazardous);
-    if (req.body.hazardDetails !== undefined) updatedDbPayload.hazard_details = req.body.hazardDetails;
-    if (req.body.hazardControlMeasures !== undefined) updatedDbPayload.hazard_control_measures = req.body.hazardControlMeasures;
-    if (req.body.hasBoiler !== undefined) updatedDbPayload.has_boiler = Boolean(req.body.hasBoiler);
-    if (req.body.boilerCapacityTph !== undefined) updatedDbPayload.boiler_capacity_tph = Number(req.body.boilerCapacityTph);
-    if (req.body.dgSetKva !== undefined) updatedDbPayload.dg_set_kva = Number(req.body.dgSetKva);
-    if (req.body.waterExtractionRequirementKld !== undefined) updatedDbPayload.water_extraction_kld = Number(req.body.waterExtractionRequirementKld);
-    if (req.body.landType !== undefined) updatedDbPayload.land_type = req.body.landType;
-    if (req.body.stage !== undefined) updatedDbPayload.stage = req.body.stage;
-    if (req.body.rawMaterials !== undefined) updatedDbPayload.raw_materials = req.body.rawMaterials;
-    if (req.body.finishedProducts !== undefined) updatedDbPayload.finished_products = req.body.finishedProducts;
-    if (req.body.byProducts !== undefined) updatedDbPayload.by_products = req.body.byProducts;
-
+    if (req.body.name !== void 0) updatedDbPayload.name = req.body.name;
+    if (req.body.businessType !== void 0) updatedDbPayload.business_type = req.body.businessType;
+    if (req.body.cin !== void 0) updatedDbPayload.cin = req.body.cin;
+    if (req.body.pan !== void 0) updatedDbPayload.pan = req.body.pan.toUpperCase().trim();
+    if (req.body.gstin !== void 0) updatedDbPayload.gstin = req.body.gstin.toUpperCase().trim();
+    if (req.body.udyamRegistration !== void 0) updatedDbPayload.udyam_registration = req.body.udyamRegistration;
+    if (req.body.authorizedPersonName !== void 0) updatedDbPayload.authorized_person_name = req.body.authorizedPersonName;
+    if (req.body.authorizedPersonDesignation !== void 0) updatedDbPayload.authorized_person_designation = req.body.authorizedPersonDesignation;
+    if (req.body.mobile !== void 0) updatedDbPayload.mobile = req.body.mobile.replace(/\D/g, "").slice(-10);
+    if (req.body.email !== void 0) updatedDbPayload.email = req.body.email;
+    if (req.body.sector !== void 0) updatedDbPayload.sector = req.body.sector;
+    if (req.body.activityDescription !== void 0) updatedDbPayload.activity_description = req.body.activityDescription;
+    if (req.body.state !== void 0) updatedDbPayload.state = req.body.state;
+    if (req.body.district !== void 0) updatedDbPayload.district = req.body.district;
+    if (req.body.taluka !== void 0) updatedDbPayload.taluka = req.body.taluka;
+    if (req.body.village !== void 0) updatedDbPayload.village = req.body.village;
+    if (req.body.plotNumber !== void 0) updatedDbPayload.plot_number = req.body.plotNumber;
+    if (req.body.pincode !== void 0) updatedDbPayload.pincode = req.body.pincode;
+    if (req.body.address !== void 0) updatedDbPayload.address = req.body.address;
+    if (req.body.scale !== void 0) updatedDbPayload.scale = req.body.scale;
+    if (req.body.investmentCrores !== void 0) updatedDbPayload.investment_crores = Number(req.body.investmentCrores);
+    if (req.body.builtUpAreaSqFt !== void 0) updatedDbPayload.built_up_area_sq_ft = Number(req.body.builtUpAreaSqFt);
+    if (req.body.workforce !== void 0) updatedDbPayload.workforce = Number(req.body.workforce);
+    if (req.body.contractWorkersCount !== void 0) updatedDbPayload.contract_workers_count = Number(req.body.contractWorkersCount);
+    if (req.body.connectedPowerKw !== void 0) updatedDbPayload.connected_power_kw = Number(req.body.connectedPowerKw);
+    if (req.body.isMIDC !== void 0) updatedDbPayload.is_midc = Boolean(req.body.isMIDC);
+    if (req.body.handlesHazardous !== void 0) updatedDbPayload.handles_hazardous = Boolean(req.body.handlesHazardous);
+    if (req.body.hazardDetails !== void 0) updatedDbPayload.hazard_details = req.body.hazardDetails;
+    if (req.body.hazardControlMeasures !== void 0) updatedDbPayload.hazard_control_measures = req.body.hazardControlMeasures;
+    if (req.body.hasBoiler !== void 0) updatedDbPayload.has_boiler = Boolean(req.body.hasBoiler);
+    if (req.body.boilerCapacityTph !== void 0) updatedDbPayload.boiler_capacity_tph = Number(req.body.boilerCapacityTph);
+    if (req.body.dgSetKva !== void 0) updatedDbPayload.dg_set_kva = Number(req.body.dgSetKva);
+    if (req.body.waterExtractionRequirementKld !== void 0) updatedDbPayload.water_extraction_kld = Number(req.body.waterExtractionRequirementKld);
+    if (req.body.landType !== void 0) updatedDbPayload.land_type = req.body.landType;
+    if (req.body.stage !== void 0) updatedDbPayload.stage = req.body.stage;
+    if (req.body.rawMaterials !== void 0) updatedDbPayload.raw_materials = req.body.rawMaterials;
+    if (req.body.finishedProducts !== void 0) updatedDbPayload.finished_products = req.body.finishedProducts;
+    if (req.body.byProducts !== void 0) updatedDbPayload.by_products = req.body.byProducts;
     const effectiveSector = updatedDbPayload.sector || existing.sector;
-    const effectiveInvestment = updatedDbPayload.investment_crores !== undefined ? updatedDbPayload.investment_crores : existing.investment_crores;
-    const effectivePower = updatedDbPayload.connected_power_kw !== undefined ? updatedDbPayload.connected_power_kw : existing.connected_power_kw;
-    const effectiveWorkforce = updatedDbPayload.workforce !== undefined ? updatedDbPayload.workforce : existing.workforce;
-
+    const effectiveInvestment = updatedDbPayload.investment_crores !== void 0 ? updatedDbPayload.investment_crores : existing.investment_crores;
+    const effectivePower = updatedDbPayload.connected_power_kw !== void 0 ? updatedDbPayload.connected_power_kw : existing.connected_power_kw;
+    const effectiveWorkforce = updatedDbPayload.workforce !== void 0 ? updatedDbPayload.workforce : existing.workforce;
     updatedDbPayload.is_profile_complete = Boolean(effectiveSector && effectiveInvestment && effectivePower && effectiveWorkforce);
-
-    const { data: updatedData, error: updateError } = await supabase
-      .from("companies")
-      .update(updatedDbPayload)
-      .eq("id", companyId)
-      .select()
-      .single();
-
+    const { data: updatedData, error: updateError } = await supabase.from("companies").update(updatedDbPayload).eq("id", companyId).select().single();
     if (updateError) {
       return res.status(500).json({ error: "Failed to save profile changes to database." });
     }
-
     const updatedProfile = dbToBusinessProfile(updatedData);
-
     res.json({
       success: true,
       message: "Company profile updated successfully.",
       profile: updatedProfile
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to update profile" });
   }
 });
-
-// =========================================================================
-// APPLICATIONS & CLEARANCES API ENDPOINTS (Protected by requireCompanyAuth)
-// =========================================================================
-
-// Helper to map status to human title and stage
-function getStatusDisplayInfo(status: string): { title: string; stage: string } {
+function getStatusDisplayInfo(status) {
   switch (status) {
     case "submitted":
       return { title: "Application Submitted", stage: "Submission" };
@@ -2020,44 +3140,36 @@ function getStatusDisplayInfo(status: string): { title: string; stage: string } 
       return { title: "Status Updated", stage: "Processing" };
   }
 }
-
-// 7. Create New Application (POST /api/applications)
 app.post("/api/applications", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { name, department } = req.body;
-
     if (!name || !name.trim()) {
       return res.status(400).json({ error: "Clearance or service name is required." });
     }
     if (!department || !department.trim()) {
       return res.status(400).json({ error: "Department is required." });
     }
-
     const generatedId = req.body.id || `APP-MH-${Date.now().toString().slice(-8)}-${Math.floor(100 + Math.random() * 900)}`;
-    const generatedCode = req.body.code || `MH-SWC-2026-${Math.floor(1000 + Math.random() * 9000)}`;
-    const submittedDateStr = req.body.submittedDate || req.body.appliedDate || new Date().toISOString();
-
-    const formattedDate = new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
-    const initialHistory = Array.isArray(req.body.statusHistory) && req.body.statusHistory.length > 0
-      ? req.body.statusHistory
-      : [
-          {
-            title: "Application Submitted",
-            date: formattedDate,
-            stage: "Submission",
-            status: "completed",
-            description: "Application successfully submitted through Maharashtra Single Window Portal."
-          },
-          {
-            title: "Under Scrutiny",
-            date: `${formattedDate}, In Progress`,
-            stage: "Scrutiny",
-            status: "current",
-            description: `Application under active scrutiny by desk officer at ${department}.`
-          }
-        ];
-
+    const generatedCode = req.body.code || `MH-SWC-2026-${Math.floor(1e3 + Math.random() * 9e3)}`;
+    const submittedDateStr = req.body.submittedDate || req.body.appliedDate || (/* @__PURE__ */ new Date()).toISOString();
+    const formattedDate = (/* @__PURE__ */ new Date()).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+    const initialHistory = Array.isArray(req.body.statusHistory) && req.body.statusHistory.length > 0 ? req.body.statusHistory : [
+      {
+        title: "Application Submitted",
+        date: formattedDate,
+        stage: "Submission",
+        status: "completed",
+        description: "Application successfully submitted through Maharashtra Single Window Portal."
+      },
+      {
+        title: "Under Scrutiny",
+        date: `${formattedDate}, In Progress`,
+        stage: "Scrutiny",
+        status: "current",
+        description: `Application under active scrutiny by desk officer at ${department}.`
+      }
+    ];
     const appData = {
       ...req.body,
       id: generatedId,
@@ -2068,47 +3180,28 @@ app.post("/api/applications", requireCompanyAuth, async (req, res) => {
       appliedDate: submittedDateStr,
       statusHistory: initialHistory
     };
-
     const dbRecord = approvalItemToDb(appData, companyId);
-    dbRecord.created_at = new Date().toISOString();
-
-    const { data: savedRow, error: insertErr } = await supabase
-      .from("applications")
-      .insert(dbRecord)
-      .select()
-      .single();
-
+    dbRecord.created_at = (/* @__PURE__ */ new Date()).toISOString();
+    const { data: savedRow, error: insertErr } = await supabase.from("applications").insert(dbRecord).select().single();
     if (insertErr) {
       console.error("Failed to insert application:", insertErr);
       return res.status(500).json({ error: "Failed to persist application into database." });
     }
-
     const application = dbToApprovalItem(savedRow);
-
     res.status(201).json({
       success: true,
       message: "Application submitted and registered successfully in Single Window System.",
       application
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to create application" });
   }
 });
-
-// 8. List Applications for Authenticated Company (GET /api/applications)
 app.get("/api/applications", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
-
-    // Seed default benchmark applications if account has no records
+    const companyId = req.authenticatedCompanyId;
     await seedDefaultApplicationsIfEmpty(companyId);
-
-    let query = supabase
-      .from("applications")
-      .select("*")
-      .eq("company_id", companyId);
-
-    // Apply optional status, department, and category filters
+    let query = supabase.from("applications").select("*").eq("company_id", companyId);
     if (req.query.status && typeof req.query.status === "string" && req.query.status.trim()) {
       query = query.eq("status", req.query.status.trim());
     }
@@ -2118,99 +3211,65 @@ app.get("/api/applications", requireCompanyAuth, async (req, res) => {
     if (req.query.category && typeof req.query.category === "string" && req.query.category.trim()) {
       query = query.ilike("category", `%${req.query.category.trim()}%`);
     }
-
     query = query.order("created_at", { ascending: false });
-
     const { data, error } = await query;
-
     if (error) {
       return res.status(500).json({ error: "Failed to fetch applications from database." });
     }
-
     const applications = (data || []).map(dbToApprovalItem);
-
     res.json({
       success: true,
       count: applications.length,
       applications
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to list applications" });
   }
 });
-
-// 9. Get Single Application by ID (GET /api/applications/:id)
 app.get("/api/applications/:id", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from("applications")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data, error } = await supabase.from("applications").select("*").eq("id", id).maybeSingle();
     if (error) {
       return res.status(500).json({ error: "Failed to fetch application details." });
     }
-
     if (!data) {
       return res.status(404).json({ error: "Application not found in Single Window System." });
     }
-
-    // Tenant Isolation Check
     if (data.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: application belongs to another enterprise." });
     }
-
     const application = dbToApprovalItem(data);
-
     res.json({
       success: true,
       application
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Error fetching application" });
   }
 });
-
-// 10. Update Application (PUT /api/applications/:id)
 app.put("/api/applications/:id", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    const { data: existing, error: fetchErr } = await supabase
-      .from("applications")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data: existing, error: fetchErr } = await supabase.from("applications").select("*").eq("id", id).maybeSingle();
     if (fetchErr || !existing) {
       return res.status(404).json({ error: "Application not found to update." });
     }
-
-    // Tenant Isolation Check
     if (existing.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: cannot modify application belonging to another enterprise." });
     }
-
     const updatePayload = approvalItemToDb(req.body, companyId);
-    updatePayload.updated_at = new Date().toISOString();
-
-    // If status is changed, automatically append to status history
+    updatePayload.updated_at = (/* @__PURE__ */ new Date()).toISOString();
     if (req.body.status && req.body.status !== existing.status) {
       const history = Array.isArray(existing.status_history) ? [...existing.status_history] : [];
-      // Mark preceding active stage as completed
-      history.forEach((h: any) => {
+      history.forEach((h) => {
         if (h.status === "current") h.status = "completed";
       });
-
       const info = getStatusDisplayInfo(req.body.status);
-      const formattedDate = new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+      const formattedDate = (/* @__PURE__ */ new Date()).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
       const isTerminal = req.body.status === "approved" || req.body.status === "rejected";
-
       history.push({
         title: info.title,
         date: formattedDate,
@@ -2218,22 +3277,12 @@ app.put("/api/applications/:id", requireCompanyAuth, async (req, res) => {
         status: isTerminal ? "completed" : "current",
         description: req.body.statusChangeNote || `Application transitioned to ${req.body.status} stage.`
       });
-
       updatePayload.status_history = history;
     }
-
-    const { data: updatedRow, error: updateErr } = await supabase
-      .from("applications")
-      .update(updatePayload)
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updatedRow, error: updateErr } = await supabase.from("applications").update(updatePayload).eq("id", id).select().single();
     if (updateErr) {
       return res.status(500).json({ error: "Failed to save application update to database." });
     }
-
-    // Trigger notification if status changed
     if (req.body.status && req.body.status !== existing.status) {
       try {
         await slaEngine.createNotification({
@@ -2241,7 +3290,7 @@ app.put("/api/applications/:id", requireCompanyAuth, async (req, res) => {
           type: "APPLICATION_STATUS_UPDATE",
           title: `Application Status: ${existing.name || existing.code}`,
           message: `Application ${existing.code || id} status has been updated to "${req.body.status}".`,
-          severity: req.body.status === "approved" ? "INFO" : (req.body.status === "rejected" ? "URGENT" : "INFO"),
+          severity: req.body.status === "approved" ? "INFO" : req.body.status === "rejected" ? "URGENT" : "INFO",
           entityType: "application",
           entityId: id,
           referenceCode: existing.code || id,
@@ -2251,58 +3300,41 @@ app.put("/api/applications/:id", requireCompanyAuth, async (req, res) => {
         console.warn("Non-fatal notification error on application update:", notifErr);
       }
     }
-
     const application = dbToApprovalItem(updatedRow);
-
     res.json({
       success: true,
       message: "Application updated successfully in Single Window System.",
       application
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to update application" });
   }
 });
-
-// 11. Application Tracking Details (GET /api/applications/:id/tracking)
 app.get("/api/applications/:id/tracking", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from("applications")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data, error } = await supabase.from("applications").select("*").eq("id", id).maybeSingle();
     if (error) {
       return res.status(500).json({ error: "Failed to retrieve tracking information." });
     }
-
     if (!data) {
       return res.status(404).json({ error: "Application not found for tracking." });
     }
-
-    // Tenant Isolation Check
     if (data.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: cannot track application belonging to another enterprise." });
     }
-
-    // Dynamic SLA calculation
     const slaDays = Number(data.sla_days) || 21;
     let daysElapsed = Number(data.days_elapsed) || 0;
     const startTimestamp = data.submitted_date || data.applied_date;
     if (startTimestamp) {
       const startDate = new Date(startTimestamp).getTime();
       if (!isNaN(startDate)) {
-        daysElapsed = Math.max(0, Math.floor((Date.now() - startDate) / (1000 * 60 * 60 * 24)));
+        daysElapsed = Math.max(0, Math.floor((Date.now() - startDate) / (1e3 * 60 * 60 * 24)));
       }
     }
-
     const daysRemaining = Math.max(0, slaDays - daysElapsed);
     const isOverdue = daysElapsed > slaDays && data.status !== "approved" && data.status !== "rejected";
-
     const tracking = {
       id: data.id,
       code: data.code,
@@ -2330,89 +3362,62 @@ app.get("/api/applications/:id/tracking", requireCompanyAuth, async (req, res) =
       inspection: data.inspection && typeof data.inspection === "object" ? data.inspection : null,
       verifiedDocsCount: Array.isArray(data.submitted_docs) ? data.submitted_docs.length : 0
     };
-
     res.json({
       success: true,
       tracking
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to retrieve tracking data" });
   }
 });
-
-// =========================================================================
-// DOCUMENT VAULT & SUPABASE STORAGE API ENDPOINTS (Protected by requireCompanyAuth)
-// =========================================================================
-
-// 12. Upload Document to Vault & Private Supabase Storage (POST /api/documents)
 app.post("/api/documents", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
-    const { 
-      name, 
-      category, 
-      applicationId, 
-      fileData, 
-      fileName, 
-      fileType, 
-      fileSize, 
-      linkedApprovals 
+    const companyId = req.authenticatedCompanyId;
+    const {
+      name,
+      category,
+      applicationId,
+      fileData,
+      fileName,
+      fileType,
+      fileSize,
+      linkedApprovals
     } = req.body;
-
     if (!name || !name.trim()) {
       return res.status(400).json({ error: "Document name or description is required." });
     }
-
-    // If applicationId provided, verify ownership of target application
     if (applicationId) {
-      const { data: appRow, error: appErr } = await supabase
-        .from("applications")
-        .select("id, company_id")
-        .eq("id", applicationId)
-        .maybeSingle();
-
+      const { data: appRow, error: appErr } = await supabase.from("applications").select("id, company_id").eq("id", applicationId).maybeSingle();
       if (appErr || !appRow) {
         return res.status(404).json({ error: "Target application not found." });
       }
-
       if (appRow.company_id !== companyId) {
         return res.status(403).json({
           error: "Access denied: cannot attach document to an application belonging to another enterprise."
         });
       }
     }
-
-    let storagePath: string | null = null;
+    let storagePath = null;
     let validatedSize = fileSize || "1.5 MB";
     let finalMimeType = fileType || "application/pdf";
-
-    if (fileData !== undefined && fileData !== null) {
+    if (fileData !== void 0 && fileData !== null) {
       const validation = validateDocumentFile(fileData, fileName || `${name}.pdf`, fileType);
       if (!validation.valid) {
         return res.status(400).json({ error: validation.error });
       }
-
       const categorySlug = (category || "GEN").toString().slice(0, 3).toUpperCase().replace(/\W/g, "");
       const documentId = req.body.id || `DOC-${categorySlug}-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
       const safeFilename = validation.safeFilename || "document.pdf";
-      
-      // Strict isolated storage path: documents/{companyId}/{applicationId || 'vault'}/{documentId}/{safeFilename}
       storagePath = `${companyId}/${applicationId || "vault"}/${documentId}/${safeFilename}`;
       validatedSize = validation.sizeMB || validatedSize;
       finalMimeType = validation.mimeType || finalMimeType;
-
-      // Upload buffer directly to Supabase Storage
-      const { error: storageError } = await supabase.storage
-        .from("documents")
-        .upload(storagePath, validation.buffer!, {
-          contentType: finalMimeType,
-          upsert: true
-        });
-
+      const { error: storageError } = await supabase.storage.from("documents").upload(storagePath, validation.buffer, {
+        contentType: finalMimeType,
+        upsert: true
+      });
       if (storageError) {
         console.error("Supabase Storage upload notice:", storageError);
       }
-
       const dbDoc = {
         id: documentId,
         company_id: companyId,
@@ -2430,24 +3435,17 @@ app.post("/api/documents", requireCompanyAuth, async (req, res) => {
         ],
         missing_or_invalid_items: [],
         correction_guidance: "Document uploaded to secure vault. Click 'Verify' to initiate validation against registration records.",
-        linked_approvals: Array.isArray(linkedApprovals) ? linkedApprovals : (applicationId ? [applicationId] : []),
+        linked_approvals: Array.isArray(linkedApprovals) ? linkedApprovals : applicationId ? [applicationId] : [],
         used_by: applicationId ? [applicationId] : [],
-        uploaded_at: new Date().toISOString(),
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
+        uploaded_at: (/* @__PURE__ */ new Date()).toISOString(),
+        created_at: (/* @__PURE__ */ new Date()).toISOString(),
+        updated_at: (/* @__PURE__ */ new Date()).toISOString()
       };
-
-      const { data: savedDoc, error: insertErr } = await supabase
-        .from("documents")
-        .insert(dbDoc)
-        .select()
-        .single();
-
+      const { data: savedDoc, error: insertErr } = await supabase.from("documents").insert(dbDoc).select().single();
       if (insertErr) {
         console.error("Failed to insert document metadata:", insertErr);
         return res.status(500).json({ error: "Failed to persist document metadata into database." });
       }
-
       return res.status(201).json({
         success: true,
         message: "Document secured in vault and uploaded to private storage successfully.",
@@ -2464,12 +3462,10 @@ app.post("/api/documents", requireCompanyAuth, async (req, res) => {
           });
         }
       }
-
       const categorySlug = (category || "GEN").toString().slice(0, 3).toUpperCase().replace(/\W/g, "");
       const documentId = req.body.id || `DOC-${categorySlug}-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
       const safeFilename = sanitizeFilename(fileName || `${name}.pdf`);
       storagePath = `${companyId}/${applicationId || "vault"}/${documentId}/${safeFilename}`;
-
       const dbDoc = {
         id: documentId,
         company_id: companyId,
@@ -2484,160 +3480,103 @@ app.post("/api/documents", requireCompanyAuth, async (req, res) => {
         checklist_results: [],
         missing_or_invalid_items: [],
         correction_guidance: "Document uploaded to secure vault. Click 'Verify' to initiate validation against registration records.",
-        linked_approvals: Array.isArray(linkedApprovals) ? linkedApprovals : (applicationId ? [applicationId] : []),
+        linked_approvals: Array.isArray(linkedApprovals) ? linkedApprovals : applicationId ? [applicationId] : [],
         used_by: applicationId ? [applicationId] : [],
-        uploaded_at: new Date().toISOString(),
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
+        uploaded_at: (/* @__PURE__ */ new Date()).toISOString(),
+        created_at: (/* @__PURE__ */ new Date()).toISOString(),
+        updated_at: (/* @__PURE__ */ new Date()).toISOString()
       };
-
-      const { data: savedDoc, error: insertErr } = await supabase
-        .from("documents")
-        .insert(dbDoc)
-        .select()
-        .single();
-
+      const { data: savedDoc, error: insertErr } = await supabase.from("documents").insert(dbDoc).select().single();
       if (insertErr) {
         return res.status(500).json({ error: "Failed to persist document record into database." });
       }
-
       return res.status(201).json({
         success: true,
         message: "Document secured in vault successfully.",
         document: dbToDocumentItem(savedDoc)
       });
     }
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to process document upload" });
   }
 });
-
-// 13. List Documents for Authenticated Company (GET /api/documents)
 app.get("/api/documents", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
-
-    let query = supabase
-      .from("documents")
-      .select("*")
-      .eq("company_id", companyId);
-
-    // If filtering by applicationId, verify company ownership first
+    const companyId = req.authenticatedCompanyId;
+    let query = supabase.from("documents").select("*").eq("company_id", companyId);
     if (req.query.applicationId && typeof req.query.applicationId === "string" && req.query.applicationId.trim()) {
       const appId = req.query.applicationId.trim();
-      const { data: appRow, error: appErr } = await supabase
-        .from("applications")
-        .select("id, company_id")
-        .eq("id", appId)
-        .maybeSingle();
-
+      const { data: appRow, error: appErr } = await supabase.from("applications").select("id, company_id").eq("id", appId).maybeSingle();
       if (appErr || !appRow) {
         return res.status(404).json({ error: "Application not found." });
       }
-
       if (appRow.company_id !== companyId) {
         return res.status(403).json({ error: "Access denied: application belongs to another enterprise." });
       }
-
       query = query.eq("application_id", appId);
     }
-
     if (req.query.category && typeof req.query.category === "string" && req.query.category.trim()) {
       query = query.eq("category", req.query.category.trim());
     }
-
     if (req.query.status && typeof req.query.status === "string" && req.query.status.trim()) {
       query = query.eq("status", req.query.status.trim());
     }
-
     query = query.order("uploaded_at", { ascending: false });
-
     const { data, error } = await query;
-
     if (error) {
       return res.status(500).json({ error: "Failed to retrieve documents from vault." });
     }
-
     const documents = (data || []).map(dbToDocumentItem);
-
     res.json({
       success: true,
       count: documents.length,
       documents
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Error fetching documents" });
   }
 });
-
-// 14. Get Single Document by ID (GET /api/documents/:id)
 app.get("/api/documents/:id", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from("documents")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data, error } = await supabase.from("documents").select("*").eq("id", id).maybeSingle();
     if (error) {
       return res.status(500).json({ error: "Failed to retrieve document." });
     }
-
     if (!data) {
       return res.status(404).json({ error: "Document not found in vault." });
     }
-
-    // Tenant Isolation Check
     if (data.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: document belongs to another enterprise." });
     }
-
     res.json({
       success: true,
       document: dbToDocumentItem(data)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Error fetching document" });
   }
 });
-
-// 15. Secure Document Access & Short-Lived Signed Download URL (GET /api/documents/:id/download)
 app.get("/api/documents/:id/download", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from("documents")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data, error } = await supabase.from("documents").select("*").eq("id", id).maybeSingle();
     if (error || !data) {
       return res.status(404).json({ error: "Document not found for download." });
     }
-
-    // Tenant Isolation Check
     if (data.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: cannot access document belonging to another enterprise." });
     }
-
-    let signedUrl: string | null = null;
-    const expiresInSeconds = 300; // 5 minutes short-lived validity
-
+    let signedUrl = null;
+    const expiresInSeconds = 300;
     if (data.storage_path) {
-      const { data: signResult, error: signErr } = await supabase.storage
-        .from("documents")
-        .createSignedUrl(data.storage_path, expiresInSeconds);
-
+      const { data: signResult, error: signErr } = await supabase.storage.from("documents").createSignedUrl(data.storage_path, expiresInSeconds);
       if (!signErr && signResult?.signedUrl) {
         signedUrl = signResult.signedUrl;
       }
     }
-
     res.json({
       success: true,
       documentId: data.id,
@@ -2645,144 +3584,88 @@ app.get("/api/documents/:id/download", requireCompanyAuth, async (req, res) => {
       fileName: data.storage_path ? path.basename(data.storage_path) : `${data.name}.pdf`,
       fileType: data.file_type,
       fileSize: data.file_size,
-      signedUrl: signedUrl,
+      signedUrl,
       expiresInSeconds: signedUrl ? expiresInSeconds : null,
-      message: signedUrl
-        ? "Short-lived signed download URL generated successfully (valid for 5 minutes)."
-        : "Direct secure download initialized."
+      message: signedUrl ? "Short-lived signed download URL generated successfully (valid for 5 minutes)." : "Direct secure download initialized."
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Error generating download access" });
   }
 });
-
-// 16. Delete Document from Storage and Vault (DELETE /api/documents/:id)
 app.delete("/api/documents/:id", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    const { data, error: fetchErr } = await supabase
-      .from("documents")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data, error: fetchErr } = await supabase.from("documents").select("*").eq("id", id).maybeSingle();
     if (fetchErr || !data) {
       return res.status(404).json({ error: "Document not found to delete." });
     }
-
-    // Tenant Isolation Check
     if (data.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: cannot delete document belonging to another enterprise." });
     }
-
-    // Remove from Supabase Storage
     if (data.storage_path) {
-      const { error: storageDelErr } = await supabase.storage
-        .from("documents")
-        .remove([data.storage_path]);
-
+      const { error: storageDelErr } = await supabase.storage.from("documents").remove([data.storage_path]);
       if (storageDelErr) {
         console.warn("Storage deletion notice:", storageDelErr.message);
       }
     }
-
-    // Delete record from PostgreSQL database
-    const { error: dbDelErr } = await supabase
-      .from("documents")
-      .delete()
-      .eq("id", id);
-
+    const { error: dbDelErr } = await supabase.from("documents").delete().eq("id", id);
     if (dbDelErr) {
       return res.status(500).json({ error: "Failed to delete document metadata from database." });
     }
-
     res.json({
       success: true,
       message: "Document deleted from storage and metadata removed from vault successfully."
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to delete document" });
   }
 });
-
-// 17. Document Pre-Validation & Verification Endpoint (POST /api/documents/:id/verify)
 app.post("/api/documents/:id/verify", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    const { data: doc, error: fetchErr } = await supabase
-      .from("documents")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data: doc, error: fetchErr } = await supabase.from("documents").select("*").eq("id", id).maybeSingle();
     if (fetchErr || !doc) {
       return res.status(404).json({ error: "Document not found to verify." });
     }
-
-    // Tenant Isolation Check
     if (doc.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: cannot verify document belonging to another enterprise." });
     }
-
-    // Fetch Company Profile for entity alignment check
-    const { data: companyProfile } = await supabase
-      .from("companies")
-      .select("name, pan, gstin, state, district")
-      .eq("id", companyId)
-      .maybeSingle();
-
+    const { data: companyProfile } = await supabase.from("companies").select("name, pan, gstin, state, district").eq("id", companyId).maybeSingle();
     const applicantName = companyProfile?.name || "Registered Enterprise";
     const companyPan = companyProfile?.pan || "PAN Not Specified";
-
     const checklistResults = [
       { check: "Document Readability & OCR Quality", passed: true, detail: "Resolution verified at 300 DPI; sharp vector text embedding." },
       { check: "Authorized Digital Signature / Stamp", passed: true, detail: "Valid digital stamp and authorized token signature confirmed." },
       { check: "Entity Identification Match", passed: true, detail: `Matched with registered entity '${applicantName}' (PAN: ${companyPan}).` },
       { check: "Statutory Validity & Non-Expiry Boundary", passed: true, detail: "Active statutory period confirmed; within statutory lifecycle." }
     ];
-
-    const { data: updatedDoc, error: updateErr } = await supabase
-      .from("documents")
-      .update({
-        status: "verified",
-        validation_score: 98,
-        checklist_results: checklistResults,
-        missing_or_invalid_items: [],
-        correction_guidance: "Pre-validation passed with zero compliance defects! Reusable document is ready for instant multi-department dossier injection into Single Document Vault.",
-        verified_at: new Date().toISOString(),
-        verified_by: "Automated Digital Vault Pre-Validator",
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updatedDoc, error: updateErr } = await supabase.from("documents").update({
+      status: "verified",
+      validation_score: 98,
+      checklist_results: checklistResults,
+      missing_or_invalid_items: [],
+      correction_guidance: "Pre-validation passed with zero compliance defects! Reusable document is ready for instant multi-department dossier injection into Single Document Vault.",
+      verified_at: (/* @__PURE__ */ new Date()).toISOString(),
+      verified_by: "Automated Digital Vault Pre-Validator",
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("id", id).select().single();
     if (updateErr) {
       return res.status(500).json({ error: "Failed to save document verification results." });
     }
-
     res.json({
       success: true,
       message: "Document pre-validated and verified successfully.",
       document: dbToDocumentItem(updatedDoc)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to verify document" });
   }
 });
-
-// =========================================================================
-// GRIEVANCES & QUERIES API ENDPOINTS (Protected by requireCompanyAuth)
-// =========================================================================
-
-// 18. Submit New Grievance or Query (POST /api/grievances)
 app.post("/api/grievances", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const {
       type = "grievance",
       businessName,
@@ -2805,8 +3688,6 @@ app.post("/api/grievances", requireCompanyAuth, async (req, res) => {
       notifyEmail = true,
       notifyPortal = true
     } = req.body;
-
-    // Validate mandatory fields
     if (!subject || typeof subject !== "string" || !subject.trim()) {
       return res.status(400).json({ error: "Grievance/Query subject is mandatory." });
     }
@@ -2814,13 +3695,13 @@ app.post("/api/grievances", requireCompanyAuth, async (req, res) => {
       return res.status(400).json({ error: "Detailed description is mandatory." });
     }
     if (!category || typeof category !== "string" || !ALLOWED_GRIEVANCE_CATEGORIES.includes(category.trim())) {
-      return res.status(400).json({ 
-        error: `Invalid grievance/query category. Allowed values: ${ALLOWED_GRIEVANCE_CATEGORIES.join(", ")}` 
+      return res.status(400).json({
+        error: `Invalid grievance/query category. Allowed values: ${ALLOWED_GRIEVANCE_CATEGORIES.join(", ")}`
       });
     }
     if (priority && !ALLOWED_GRIEVANCE_PRIORITIES.includes(priority.trim())) {
-      return res.status(400).json({ 
-        error: `Invalid priority level. Allowed values: ${ALLOWED_GRIEVANCE_PRIORITIES.join(", ")}` 
+      return res.status(400).json({
+        error: `Invalid priority level. Allowed values: ${ALLOWED_GRIEVANCE_PRIORITIES.join(", ")}`
       });
     }
     if (!mobile || !/^[0-9]{10}$/.test(String(mobile).trim())) {
@@ -2829,45 +3710,28 @@ app.post("/api/grievances", requireCompanyAuth, async (req, res) => {
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email).trim())) {
       return res.status(400).json({ error: "Valid contact email address is mandatory." });
     }
-
-    // If an application ID or application number is linked, verify tenant ownership
     const targetAppRef = applicationId || applicationNumber;
     if (targetAppRef) {
-      const { data: linkedApps, error: appCheckErr } = await supabase
-        .from("applications")
-        .select("id, company_id, code, department, name")
-        .or(`id.eq.${targetAppRef},code.eq.${targetAppRef}`)
-        .limit(1);
-
+      const { data: linkedApps, error: appCheckErr } = await supabase.from("applications").select("id, company_id, code, department, name").or(`id.eq.${targetAppRef},code.eq.${targetAppRef}`).limit(1);
       if (!appCheckErr && linkedApps && linkedApps.length > 0) {
         const linkedApp = linkedApps[0];
         if (linkedApp.company_id !== companyId) {
-          return res.status(403).json({ 
-            error: "Access denied: Cannot link grievance to an application belonging to another enterprise." 
+          return res.status(403).json({
+            error: "Access denied: Cannot link grievance to an application belonging to another enterprise."
           });
         }
       }
     }
-
-    // Fetch company profile to fill missing default details if not provided
-    const { data: companyProfile } = await supabase
-      .from("companies")
-      .select("name, contact_person, mobile, email, district, taluka, is_midc, industrial_park")
-      .eq("id", companyId)
-      .maybeSingle();
-
+    const { data: companyProfile } = await supabase.from("companies").select("name, contact_person, mobile, email, district, taluka, is_midc, industrial_park").eq("id", companyId).maybeSingle();
     const finalBusinessName = businessName || companyProfile?.name || "Registered Enterprise";
     const finalApplicantName = applicantName || companyProfile?.contact_person || "Authorized Signatory";
     const finalDistrict = district || companyProfile?.district || "Maharashtra";
     const finalTaluka = taluka || companyProfile?.taluka || "";
     const finalMidcArea = midcArea || companyProfile?.industrial_park || "";
-
-    // Generate unique human-readable tracking ID
-    const randomSuffix = Math.floor(100000 + Math.random() * 900000);
+    const randomSuffix = Math.floor(1e5 + Math.random() * 9e5);
     const idPrefix = type === "query" ? "MQY" : "MGV";
     const generatedId = `${idPrefix}-2026-${randomSuffix}`;
-
-    const nowIso = new Date().toISOString();
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
     const initialStatus = "Submitted";
     const initialHistory = [
       {
@@ -2877,7 +3741,6 @@ app.post("/api/grievances", requireCompanyAuth, async (req, res) => {
         note: type === "query" ? "Technical query submitted for official review." : "Grievance registered under RTS Act 2015."
       }
     ];
-
     const dbPayload = {
       id: generatedId,
       company_id: companyId,
@@ -2910,42 +3773,26 @@ app.post("/api/grievances", requireCompanyAuth, async (req, res) => {
       created_at: nowIso,
       updated_at: nowIso
     };
-
-    const { data: insertedData, error: insertError } = await supabase
-      .from("grievances")
-      .insert(dbPayload)
-      .select()
-      .single();
-
+    const { data: insertedData, error: insertError } = await supabase.from("grievances").insert(dbPayload).select().single();
     if (insertError) {
       console.error("Grievance insert error:", insertError);
       return res.status(500).json({ error: "Failed to register grievance in database." });
     }
-
     res.status(201).json({
       success: true,
       message: `${type === "query" ? "Query" : "Grievance"} registered successfully.`,
       grievance: dbToGrievanceRecord(insertedData)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to register grievance" });
   }
 });
-
-// 19. List Company Grievances & Queries (GET /api/grievances)
 app.get("/api/grievances", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     await seedDefaultGrievancesIfEmpty(companyId);
-
     const { status, category, priority, applicationId, type } = req.query;
-
-    let query = supabase
-      .from("grievances")
-      .select("*")
-      .eq("company_id", companyId)
-      .order("created_at", { ascending: false });
-
+    let query = supabase.from("grievances").select("*").eq("company_id", companyId).order("created_at", { ascending: false });
     if (status && typeof status === "string") {
       query = query.eq("status", status);
     }
@@ -2961,164 +3808,123 @@ app.get("/api/grievances", requireCompanyAuth, async (req, res) => {
     if (applicationId && typeof applicationId === "string") {
       query = query.or(`application_id.eq.${applicationId},application_number.eq.${applicationId}`);
     }
-
     const { data, error } = await query;
-
     if (error) {
       return res.status(500).json({ error: "Failed to fetch grievances." });
     }
-
     const records = (data || []).map(dbToGrievanceRecord);
     res.json({
       success: true,
       count: records.length,
       grievances: records
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to retrieve grievances" });
   }
 });
-
-// 20. Public / Company Reference Status Lookup (GET /api/grievances/status/:reference)
 app.get("/api/grievances/status/:reference", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { reference } = req.params;
-
     if (!reference || !reference.trim()) {
       return res.status(400).json({ error: "Reference number is required." });
     }
-
     const trimmedRef = reference.trim();
-    const { data, error } = await supabase
-      .from("grievances")
-      .select("*")
-      .or(`id.eq.${trimmedRef},application_number.eq.${trimmedRef}`)
-      .maybeSingle();
-
+    const { data, error } = await supabase.from("grievances").select("*").or(`id.eq.${trimmedRef},application_number.eq.${trimmedRef}`).maybeSingle();
     if (error || !data) {
       return res.status(404).json({ error: "Grievance or Query reference not found." });
     }
-
-    // Tenant Isolation Check
     if (data.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: Reference belongs to another enterprise." });
     }
-
     res.json({
       success: true,
       grievance: dbToGrievanceRecord(data)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to look up grievance status" });
   }
 });
-
-// 21. Get Single Grievance by ID (GET /api/grievances/:id)
 app.get("/api/grievances/:id", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from("grievances")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data, error } = await supabase.from("grievances").select("*").eq("id", id).maybeSingle();
     if (error || !data) {
       return res.status(404).json({ error: "Grievance record not found." });
     }
-
-    // Tenant Isolation Check
     if (data.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: Cannot access grievance belonging to another enterprise." });
     }
-
     res.json({
       success: true,
       grievance: dbToGrievanceRecord(data)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to retrieve grievance" });
   }
 });
-
-// 22. Update Grievance (PUT /api/grievances/:id)
 app.put("/api/grievances/:id", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    // Check existing record & ownership
-    const { data: existing, error: fetchError } = await supabase
-      .from("grievances")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data: existing, error: fetchError } = await supabase.from("grievances").select("*").eq("id", id).maybeSingle();
     if (fetchError || !existing) {
       return res.status(404).json({ error: "Grievance record not found to update." });
     }
-
     if (existing.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: Cannot update grievance belonging to another enterprise." });
     }
-
-    // Prepare updated fields (prevent company users from editing department responses, assigned officer, resolution date)
-    const updatePayload: Record<string, any> = {
-      updated_at: new Date().toISOString(),
-      last_updated: new Date().toISOString()
+    const updatePayload = {
+      updated_at: (/* @__PURE__ */ new Date()).toISOString(),
+      last_updated: (/* @__PURE__ */ new Date()).toISOString()
     };
-
-    if (req.body.subject !== undefined && req.body.subject.trim()) {
+    if (req.body.subject !== void 0 && req.body.subject.trim()) {
       updatePayload.subject = req.body.subject.trim();
     }
-    if (req.body.description !== undefined && req.body.description.trim()) {
+    if (req.body.description !== void 0 && req.body.description.trim()) {
       updatePayload.description = req.body.description.trim();
     }
-    if (req.body.category !== undefined) {
+    if (req.body.category !== void 0) {
       if (!ALLOWED_GRIEVANCE_CATEGORIES.includes(req.body.category.trim())) {
-        return res.status(400).json({ 
-          error: `Invalid category. Allowed values: ${ALLOWED_GRIEVANCE_CATEGORIES.join(", ")}` 
+        return res.status(400).json({
+          error: `Invalid category. Allowed values: ${ALLOWED_GRIEVANCE_CATEGORIES.join(", ")}`
         });
       }
       updatePayload.category = req.body.category.trim();
     }
-    if (req.body.priority !== undefined) {
+    if (req.body.priority !== void 0) {
       if (!ALLOWED_GRIEVANCE_PRIORITIES.includes(req.body.priority.trim())) {
-        return res.status(400).json({ 
-          error: `Invalid priority. Allowed values: ${ALLOWED_GRIEVANCE_PRIORITIES.join(", ")}` 
+        return res.status(400).json({
+          error: `Invalid priority. Allowed values: ${ALLOWED_GRIEVANCE_PRIORITIES.join(", ")}`
         });
       }
       updatePayload.priority = req.body.priority.trim();
     }
-    if (req.body.mobile !== undefined) {
+    if (req.body.mobile !== void 0) {
       if (!/^[0-9]{10}$/.test(String(req.body.mobile).trim())) {
         return res.status(400).json({ error: "Mobile number must be 10 digits." });
       }
       updatePayload.mobile = String(req.body.mobile).trim();
     }
-    if (req.body.email !== undefined) {
+    if (req.body.email !== void 0) {
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(req.body.email).trim())) {
         return res.status(400).json({ error: "Invalid email address format." });
       }
       updatePayload.email = String(req.body.email).trim().toLowerCase();
     }
-    if (req.body.notifySms !== undefined) updatePayload.notify_sms = Boolean(req.body.notifySms);
-    if (req.body.notifyEmail !== undefined) updatePayload.notify_email = Boolean(req.body.notifyEmail);
-    if (req.body.notifyPortal !== undefined) updatePayload.notify_portal = Boolean(req.body.notifyPortal);
-    if (req.body.documents !== undefined && Array.isArray(req.body.documents)) {
+    if (req.body.notifySms !== void 0) updatePayload.notify_sms = Boolean(req.body.notifySms);
+    if (req.body.notifyEmail !== void 0) updatePayload.notify_email = Boolean(req.body.notifyEmail);
+    if (req.body.notifyPortal !== void 0) updatePayload.notify_portal = Boolean(req.body.notifyPortal);
+    if (req.body.documents !== void 0 && Array.isArray(req.body.documents)) {
       updatePayload.documents = req.body.documents;
     }
-
-    // Status History tracking
     let currentHistory = Array.isArray(existing.status_history) ? [...existing.status_history] : [];
     if (req.body.status && req.body.status !== existing.status) {
       updatePayload.status = req.body.status;
       currentHistory.push({
         status: req.body.status,
-        changedAt: new Date().toISOString(),
+        changedAt: (/* @__PURE__ */ new Date()).toISOString(),
         changedBy: "company",
         note: req.body.statusNote || `Status updated to ${req.body.status} by applicant.`
       });
@@ -3126,25 +3932,16 @@ app.put("/api/grievances/:id", requireCompanyAuth, async (req, res) => {
     } else if (req.body.statusNote) {
       currentHistory.push({
         status: existing.status,
-        changedAt: new Date().toISOString(),
+        changedAt: (/* @__PURE__ */ new Date()).toISOString(),
         changedBy: "company",
         note: req.body.statusNote
       });
       updatePayload.status_history = currentHistory;
     }
-
-    const { data: updatedRecord, error: updateError } = await supabase
-      .from("grievances")
-      .update(updatePayload)
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updatedRecord, error: updateError } = await supabase.from("grievances").update(updatePayload).eq("id", id).select().single();
     if (updateError) {
       return res.status(500).json({ error: "Failed to update grievance." });
     }
-
-    // Trigger notification if status changed
     if (req.body.status && req.body.status !== existing.status) {
       try {
         await slaEngine.createNotification({
@@ -3152,7 +3949,7 @@ app.put("/api/grievances/:id", requireCompanyAuth, async (req, res) => {
           type: "GRIEVANCE_STATUS_UPDATE",
           title: `Grievance Status: #${existing.reference_number || id}`,
           message: `Grievance #${existing.reference_number || id} status has been updated to "${req.body.status}".`,
-          severity: req.body.status === "resolved" ? "INFO" : (req.body.status === "rejected" ? "URGENT" : "INFO"),
+          severity: req.body.status === "resolved" ? "INFO" : req.body.status === "rejected" ? "URGENT" : "INFO",
           entityType: "grievance",
           entityId: id,
           referenceCode: existing.reference_number || id,
@@ -3162,25 +3959,18 @@ app.put("/api/grievances/:id", requireCompanyAuth, async (req, res) => {
         console.warn("Non-fatal notification error on grievance update:", notifErr);
       }
     }
-
     res.json({
       success: true,
       message: "Grievance updated successfully.",
       grievance: dbToGrievanceRecord(updatedRecord)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to update grievance" });
   }
 });
-
-// =========================================================================
-// FEEDBACK API ENDPOINTS (Protected by requireCompanyAuth)
-// =========================================================================
-
-// 23. Submit Feedback (POST /api/feedback)
 app.post("/api/feedback", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const {
       feedbackType,
       relatedModule,
@@ -3191,43 +3981,33 @@ app.post("/api/feedback", requireCompanyAuth, async (req, res) => {
       mobile,
       email
     } = req.body;
-
-    // Validate feedbackType
     if (!feedbackType || typeof feedbackType !== "string" || !ALLOWED_FEEDBACK_TYPES.includes(feedbackType.trim())) {
       return res.status(400).json({
         error: `Invalid or missing feedback type. Allowed types: ${ALLOWED_FEEDBACK_TYPES.join(", ")}`
       });
     }
-
-    // Validate relatedModule
     if (!relatedModule || typeof relatedModule !== "string" || !ALLOWED_FEEDBACK_MODULES.includes(relatedModule.trim())) {
       return res.status(400).json({
         error: `Invalid or missing service/module. Allowed modules: ${ALLOWED_FEEDBACK_MODULES.join(", ")}`
       });
     }
-
-    // Validate rating (Integer 1 to 5)
     const numRating = Number(rating);
     if (!Number.isInteger(numRating) || numRating < 1 || numRating > 5) {
       return res.status(400).json({
         error: "Rating must be an integer between 1 and 5."
       });
     }
-
-    // Validate message
     if (!message || typeof message !== "string" || !message.trim()) {
       return res.status(400).json({
         error: "Feedback message cannot be empty."
       });
     }
-    if (message.trim().length > 2000) {
+    if (message.trim().length > 2e3) {
       return res.status(400).json({
         error: "Feedback message exceeds maximum length of 2000 characters."
       });
     }
-
-    // Validate optional mobile (10 digits if supplied)
-    if (mobile !== undefined && mobile !== null && String(mobile).trim() !== "") {
+    if (mobile !== void 0 && mobile !== null && String(mobile).trim() !== "") {
       const cleanMobile = String(mobile).trim().replace(/\D/g, "");
       if (cleanMobile.length !== 10) {
         return res.status(400).json({
@@ -3235,9 +4015,7 @@ app.post("/api/feedback", requireCompanyAuth, async (req, res) => {
         });
       }
     }
-
-    // Validate optional email format
-    if (email !== undefined && email !== null && String(email).trim() !== "") {
+    if (email !== void 0 && email !== null && String(email).trim() !== "") {
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
       if (!emailRegex.test(String(email).trim())) {
         return res.status(400).json({
@@ -3245,16 +4023,9 @@ app.post("/api/feedback", requireCompanyAuth, async (req, res) => {
         });
       }
     }
-
-    // Verify applicationRef ownership if supplied
     if (applicationRef && typeof applicationRef === "string" && applicationRef.trim()) {
       const trimmedRef = applicationRef.trim();
-      const { data: linkedApps, error: appCheckErr } = await supabase
-        .from("applications")
-        .select("id, company_id, code")
-        .or(`id.eq.${trimmedRef},code.eq.${trimmedRef}`)
-        .limit(1);
-
+      const { data: linkedApps, error: appCheckErr } = await supabase.from("applications").select("id, company_id, code").or(`id.eq.${trimmedRef},code.eq.${trimmedRef}`).limit(1);
       if (!appCheckErr && linkedApps && linkedApps.length > 0) {
         const linkedApp = linkedApps[0];
         if (linkedApp.company_id !== companyId) {
@@ -3264,23 +4035,13 @@ app.post("/api/feedback", requireCompanyAuth, async (req, res) => {
         }
       }
     }
-
-    // Prefill name, email, mobile from company profile if not provided
-    const { data: companyProfile } = await supabase
-      .from("companies")
-      .select("name, contact_person, mobile, email")
-      .eq("id", companyId)
-      .maybeSingle();
-
+    const { data: companyProfile } = await supabase.from("companies").select("name, contact_person, mobile, email").eq("id", companyId).maybeSingle();
     const finalName = name?.trim() || companyProfile?.name || companyProfile?.contact_person || "Enterprise User";
-    const finalMobile = mobile ? String(mobile).trim().replace(/\D/g, "") : (companyProfile?.mobile || null);
+    const finalMobile = mobile ? String(mobile).trim().replace(/\D/g, "") : companyProfile?.mobile || null;
     const finalEmail = email?.trim()?.toLowerCase() || companyProfile?.email || null;
-
-    // Generate unique feedback reference: MUS-FB-2026-XXXXXX
-    const randomSuffix = Math.floor(100000 + Math.random() * 900000);
+    const randomSuffix = Math.floor(1e5 + Math.random() * 9e5);
     const generatedId = `MUS-FB-2026-${randomSuffix}`;
-
-    const nowIso = new Date().toISOString();
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
     const dbPayload = {
       id: generatedId,
       company_id: companyId,
@@ -3297,42 +4058,26 @@ app.post("/api/feedback", requireCompanyAuth, async (req, res) => {
       created_at: nowIso,
       updated_at: nowIso
     };
-
-    const { data: insertedData, error: insertError } = await supabase
-      .from("feedback")
-      .insert(dbPayload)
-      .select()
-      .single();
-
+    const { data: insertedData, error: insertError } = await supabase.from("feedback").insert(dbPayload).select().single();
     if (insertError) {
       console.error("Feedback insertion error:", insertError);
       return res.status(500).json({ error: "Failed to save feedback to database." });
     }
-
     res.status(201).json({
       success: true,
       message: "Feedback submitted successfully.",
       feedback: dbToFeedbackRecord(insertedData)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to submit feedback" });
   }
 });
-
-// 24. List Company Feedback (GET /api/feedback)
 app.get("/api/feedback", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     await seedDefaultFeedbackIfEmpty(companyId);
-
     const { status, type, module, rating } = req.query;
-
-    let query = supabase
-      .from("feedback")
-      .select("*")
-      .eq("company_id", companyId)
-      .order("created_at", { ascending: false });
-
+    let query = supabase.from("feedback").select("*").eq("company_id", companyId).order("created_at", { ascending: false });
     if (status && typeof status === "string") {
       query = query.eq("status", status);
     }
@@ -3345,131 +4090,91 @@ app.get("/api/feedback", requireCompanyAuth, async (req, res) => {
     if (rating) {
       query = query.eq("rating", Number(rating));
     }
-
     const { data, error } = await query;
-
     if (error) {
       return res.status(500).json({ error: "Failed to retrieve feedback records." });
     }
-
     const records = (data || []).map(dbToFeedbackRecord);
     res.json({
       success: true,
       count: records.length,
       feedback: records
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to retrieve feedback" });
   }
 });
-
-// 25. Lookup Feedback Status by Reference (GET /api/feedback/status/:reference)
 app.get("/api/feedback/status/:reference", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { reference } = req.params;
-
     if (!reference || !reference.trim()) {
       return res.status(400).json({ error: "Feedback reference is required." });
     }
-
     const trimmedRef = reference.trim();
-    const { data, error } = await supabase
-      .from("feedback")
-      .select("*")
-      .eq("id", trimmedRef)
-      .maybeSingle();
-
+    const { data, error } = await supabase.from("feedback").select("*").eq("id", trimmedRef).maybeSingle();
     if (error || !data) {
       return res.status(404).json({ error: "Feedback record not found." });
     }
-
-    // Tenant Isolation Check
     if (data.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: Feedback belongs to another enterprise." });
     }
-
     res.json({
       success: true,
       feedback: dbToFeedbackRecord(data)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to look up feedback status" });
   }
 });
-
-// 26. Get Single Feedback by ID (GET /api/feedback/:id)
 app.get("/api/feedback/:id", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from("feedback")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data, error } = await supabase.from("feedback").select("*").eq("id", id).maybeSingle();
     if (error || !data) {
       return res.status(404).json({ error: "Feedback record not found." });
     }
-
-    // Tenant Isolation Check
     if (data.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: Cannot view feedback belonging to another enterprise." });
     }
-
     res.json({
       success: true,
       feedback: dbToFeedbackRecord(data)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to retrieve feedback" });
   }
 });
-
-// 27. Update / Reply to Feedback (PUT /api/feedback/:id)
 app.put("/api/feedback/:id", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    const { data: existing, error: fetchError } = await supabase
-      .from("feedback")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data: existing, error: fetchError } = await supabase.from("feedback").select("*").eq("id", id).maybeSingle();
     if (fetchError || !existing) {
       return res.status(404).json({ error: "Feedback record not found to update." });
     }
-
     if (existing.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: Cannot update feedback belonging to another enterprise." });
     }
-
-    // Prepare updated fields (prevent user from altering department_response, status to arbitrary values, etc.)
-    const updatePayload: Record<string, any> = {
-      updated_at: new Date().toISOString()
+    const updatePayload = {
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     };
-
-    if (req.body.message !== undefined && req.body.message.trim()) {
+    if (req.body.message !== void 0 && req.body.message.trim()) {
       updatePayload.message = req.body.message.trim();
     }
-    if (req.body.rating !== undefined) {
+    if (req.body.rating !== void 0) {
       const numRating = Number(req.body.rating);
       if (Number.isInteger(numRating) && numRating >= 1 && numRating <= 5) {
         updatePayload.rating = numRating;
       }
     }
-
-    // Handle user replies thread
     if (req.body.replyText && typeof req.body.replyText === "string" && req.body.replyText.trim()) {
       const currentReplies = Array.isArray(existing.replies) ? [...existing.replies] : [];
       currentReplies.push({
         sender: "user",
         message: req.body.replyText.trim(),
-        date: new Date().toLocaleDateString("en-GB", {
+        date: (/* @__PURE__ */ new Date()).toLocaleDateString("en-GB", {
           day: "2-digit",
           month: "short",
           year: "numeric",
@@ -3482,36 +4187,22 @@ app.put("/api/feedback/:id", requireCompanyAuth, async (req, res) => {
         updatePayload.status = "Under Review";
       }
     }
-
-    const { data: updatedRecord, error: updateError } = await supabase
-      .from("feedback")
-      .update(updatePayload)
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updatedRecord, error: updateError } = await supabase.from("feedback").update(updatePayload).eq("id", id).select().single();
     if (updateError) {
       return res.status(500).json({ error: "Failed to update feedback record." });
     }
-
     res.json({
       success: true,
       message: "Feedback updated successfully.",
       feedback: dbToFeedbackRecord(updatedRecord)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to update feedback" });
   }
 });
-
-// =========================================================================
-// INVESTOR SERVICES & INVESTMENT PLANNER API (Protected by requireCompanyAuth)
-// =========================================================================
-
-// 28. Save Investment Plan (POST /api/invest-plans)
 app.post("/api/invest-plans", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const {
       projectName,
       industrySector,
@@ -3521,8 +4212,6 @@ app.post("/api/invest-plans", requireCompanyAuth, async (req, res) => {
       calculatedResults = {},
       status = "active"
     } = req.body;
-
-    // Validate required fields
     if (!projectName || typeof projectName !== "string" || !projectName.trim()) {
       return res.status(400).json({ error: "Project name is required." });
     }
@@ -3532,15 +4221,12 @@ app.post("/api/invest-plans", requireCompanyAuth, async (req, res) => {
     if (!location || typeof location !== "string" || !location.trim()) {
       return res.status(400).json({ error: "Location is required." });
     }
-    if (investmentCr !== undefined && (isNaN(Number(investmentCr)) || Number(investmentCr) < 0)) {
+    if (investmentCr !== void 0 && (isNaN(Number(investmentCr)) || Number(investmentCr) < 0)) {
       return res.status(400).json({ error: "Investment amount must be a positive number." });
     }
-
-    // Generate unique human-readable plan reference: MUS-INV-2026-XXXXXX
-    const randomSuffix = Math.floor(100000 + Math.random() * 900000);
+    const randomSuffix = Math.floor(1e5 + Math.random() * 9e5);
     const generatedId = `MUS-INV-2026-${randomSuffix}`;
-
-    const nowIso = new Date().toISOString();
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
     const dbPayload = {
       id: generatedId,
       company_id: companyId,
@@ -3551,7 +4237,7 @@ app.post("/api/invest-plans", requireCompanyAuth, async (req, res) => {
       items: Array.isArray(items) ? items : [],
       calculated_results: {
         ...calculatedResults,
-        disclaimer: "Indicative Information — Verify latest requirements with the relevant official authority.",
+        disclaimer: "Indicative Information \u2014 Verify latest requirements with the relevant official authority.",
         preliminaryGuidance: true
       },
       status: status || "active",
@@ -3559,42 +4245,26 @@ app.post("/api/invest-plans", requireCompanyAuth, async (req, res) => {
       created_at: nowIso,
       updated_at: nowIso
     };
-
-    const { data: insertedData, error: insertError } = await supabase
-      .from("invest_plans")
-      .insert(dbPayload)
-      .select()
-      .single();
-
+    const { data: insertedData, error: insertError } = await supabase.from("invest_plans").insert(dbPayload).select().single();
     if (insertError) {
       console.error("Investment plan insertion error:", insertError);
       return res.status(500).json({ error: "Failed to save investment plan to database." });
     }
-
     res.status(201).json({
       success: true,
       message: "Investment plan created successfully.",
       plan: dbToInvestPlan(insertedData)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to save investment plan" });
   }
 });
-
-// 29. List Company Investment Plans (GET /api/invest-plans)
 app.get("/api/invest-plans", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     await seedDefaultInvestPlanIfEmpty(companyId);
-
     const { status, sector, location } = req.query;
-
-    let query = supabase
-      .from("invest_plans")
-      .select("*")
-      .eq("company_id", companyId)
-      .order("created_at", { ascending: false });
-
+    let query = supabase.from("invest_plans").select("*").eq("company_id", companyId).order("created_at", { ascending: false });
     if (status && typeof status === "string") {
       query = query.eq("status", status);
     }
@@ -3604,192 +4274,117 @@ app.get("/api/invest-plans", requireCompanyAuth, async (req, res) => {
     if (location && typeof location === "string") {
       query = query.ilike("location", `%${location}%`);
     }
-
     const { data, error } = await query;
-
     if (error) {
       return res.status(500).json({ error: "Failed to fetch investment plans." });
     }
-
     const records = (data || []).map(dbToInvestPlan);
     res.json({
       success: true,
       count: records.length,
       plans: records
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to retrieve investment plans" });
   }
 });
-
-// 30. Get Investment Plan by Reference (GET /api/invest-plans/reference/:reference)
 app.get("/api/invest-plans/reference/:reference", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { reference } = req.params;
-
     if (!reference || !reference.trim()) {
       return res.status(400).json({ error: "Plan reference is required." });
     }
-
     const trimmedRef = reference.trim();
-    const { data, error } = await supabase
-      .from("invest_plans")
-      .select("*")
-      .eq("id", trimmedRef)
-      .maybeSingle();
-
+    const { data, error } = await supabase.from("invest_plans").select("*").eq("id", trimmedRef).maybeSingle();
     if (error || !data) {
       return res.status(404).json({ error: "Investment plan not found." });
     }
-
-    // Tenant Isolation Check
     if (data.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: Investment plan belongs to another enterprise." });
     }
-
     res.json({
       success: true,
       plan: dbToInvestPlan(data)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to retrieve investment plan" });
   }
 });
-
-// 31. Get Single Investment Plan by ID (GET /api/invest-plans/:id)
 app.get("/api/invest-plans/:id", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from("invest_plans")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data, error } = await supabase.from("invest_plans").select("*").eq("id", id).maybeSingle();
     if (error || !data) {
       return res.status(404).json({ error: "Investment plan not found." });
     }
-
-    // Tenant Isolation Check
     if (data.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: Cannot access investment plan belonging to another enterprise." });
     }
-
     res.json({
       success: true,
       plan: dbToInvestPlan(data)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to retrieve investment plan" });
   }
 });
-
-// 32. Update Investment Plan (PUT /api/invest-plans/:id)
 app.put("/api/invest-plans/:id", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const { id } = req.params;
-
-    // Check existing record & ownership
-    const { data: existing, error: fetchError } = await supabase
-      .from("invest_plans")
-      .select("*")
-      .eq("id", id)
-      .maybeSingle();
-
+    const { data: existing, error: fetchError } = await supabase.from("invest_plans").select("*").eq("id", id).maybeSingle();
     if (fetchError || !existing) {
       return res.status(404).json({ error: "Investment plan not found to update." });
     }
-
     if (existing.company_id !== companyId) {
       return res.status(403).json({ error: "Access denied: Cannot update investment plan belonging to another enterprise." });
     }
-
-    const nowIso = new Date().toISOString();
-    const updatePayload: Record<string, any> = {
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+    const updatePayload = {
       updated_at: nowIso,
       last_updated: nowIso
     };
-
-    if (req.body.projectName !== undefined && req.body.projectName.trim()) {
+    if (req.body.projectName !== void 0 && req.body.projectName.trim()) {
       updatePayload.project_name = req.body.projectName.trim();
     }
-    if (req.body.industrySector !== undefined && req.body.industrySector.trim()) {
+    if (req.body.industrySector !== void 0 && req.body.industrySector.trim()) {
       updatePayload.industry_sector = req.body.industrySector.trim();
     }
-    if (req.body.location !== undefined && req.body.location.trim()) {
+    if (req.body.location !== void 0 && req.body.location.trim()) {
       updatePayload.location = req.body.location.trim();
     }
-    if (req.body.investmentCr !== undefined && !isNaN(Number(req.body.investmentCr))) {
+    if (req.body.investmentCr !== void 0 && !isNaN(Number(req.body.investmentCr))) {
       updatePayload.investment_cr = Number(req.body.investmentCr);
     }
-    if (req.body.items !== undefined && Array.isArray(req.body.items)) {
+    if (req.body.items !== void 0 && Array.isArray(req.body.items)) {
       updatePayload.items = req.body.items;
     }
-    if (req.body.calculatedResults !== undefined && typeof req.body.calculatedResults === "object") {
+    if (req.body.calculatedResults !== void 0 && typeof req.body.calculatedResults === "object") {
       updatePayload.calculated_results = {
         ...req.body.calculatedResults,
-        disclaimer: "Indicative Information — Verify latest requirements with the relevant official authority.",
+        disclaimer: "Indicative Information \u2014 Verify latest requirements with the relevant official authority.",
         preliminaryGuidance: true
       };
     }
-    if (req.body.status !== undefined) {
+    if (req.body.status !== void 0) {
       updatePayload.status = req.body.status;
     }
-
-    const { data: updatedRecord, error: updateError } = await supabase
-      .from("invest_plans")
-      .update(updatePayload)
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updatedRecord, error: updateError } = await supabase.from("invest_plans").update(updatePayload).eq("id", id).select().single();
     if (updateError) {
       return res.status(500).json({ error: "Failed to update investment plan." });
     }
-
     res.json({
       success: true,
       message: "Investment plan updated successfully.",
       plan: dbToInvestPlan(updatedRecord)
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to update investment plan" });
   }
 });
-
-// =========================================================================
-// REGULATORY KNOWLEDGE BASE & APPROVAL RULE ENGINE (STEP 8)
-// =========================================================================
-
-/**
- * Core Rule Engine for Maharashtra Industrial Approvals Applicability
- */
-export async function evaluateApprovalRules(inputs: {
-  industry?: string;
-  subSector?: string;
-  district?: string;
-  taluka?: string;
-  midcArea?: string;
-  isMIDC?: boolean;
-  investment?: number;
-  workforce?: number;
-  contractWorkers?: number;
-  projectStage?: string;
-  projectType?: string;
-  landStatus?: string;
-  connectedPower?: number;
-  waterRequirement?: number;
-  hazardousMaterial?: boolean;
-  hasBoiler?: boolean;
-  builtUpSqFt?: number;
-  natureOfBiz?: string;
-  manufacturingActivity?: string;
-  specialCategory?: string;
-}) {
+async function evaluateApprovalRules(inputs) {
   const normSector = (inputs.industry || "Engineering & Heavy Manufacturing").trim();
   const workforce = Number(inputs.workforce) || 0;
   const contractWorkers = Number(inputs.contractWorkers) || 0;
@@ -3800,8 +4395,6 @@ export async function evaluateApprovalRules(inputs: {
   const stage = (inputs.projectStage || "Pre-Establishment").trim();
   const builtUpSqFt = Number(inputs.builtUpSqFt) || 0;
   const hasBoiler = Boolean(inputs.hasBoiler);
-
-  // 1. Fetch relevant knowledge base data from Supabase
   const [
     { data: approvalsData },
     { data: departmentsData },
@@ -3819,48 +4412,30 @@ export async function evaluateApprovalRules(inputs: {
     supabase.from("industry_approvals").select("*"),
     supabase.from("approval_documents").select("*")
   ]);
-
-  const departmentsMap = new Map<string, any>((departmentsData || []).map(d => [d.id, d]));
-  const sourcesMap = new Map<string, any>((sourcesData || []).map(s => [s.id, s]));
+  const departmentsMap = new Map((departmentsData || []).map((d) => [d.id, d]));
+  const sourcesMap = new Map((sourcesData || []).map((s) => [s.id, s]));
   const industryApprovals = industryApprovalsData || [];
-  // Exclude Rejected and Archived approvals from user-facing analysis
-  const allApprovals = (approvalsData || []).filter(app => app.status !== "Rejected" && app.status !== "Archived");
-  // Only VERIFIED rules influence the dynamic evaluation
-  const rules = (rulesData || []).filter(r => r.status === "Verified");
+  const allApprovals = (approvalsData || []).filter((app2) => app2.status !== "Rejected" && app2.status !== "Archived");
+  const rules = (rulesData || []).filter((r) => r.status === "Verified");
   const docsList = approvalDocsData || [];
-
-  // Find matching industry record
-  const matchingIndustry = (industryData || []).find(ind => 
-    ind.sector.toLowerCase() === normSector.toLowerCase() ||
-    ind.name.toLowerCase() === normSector.toLowerCase() ||
-    normSector.toLowerCase().includes(ind.sector.toLowerCase())
+  const matchingIndustry = (industryData || []).find(
+    (ind) => ind.sector.toLowerCase() === normSector.toLowerCase() || ind.name.toLowerCase() === normSector.toLowerCase() || normSector.toLowerCase().includes(ind.sector.toLowerCase())
   );
-
-  const matchedIndustryApprovals = matchingIndustry
-    ? industryApprovals.filter(ia => ia.industry_id === matchingIndustry.id)
-    : [];
-
-  const results: any[] = [];
-
-  for (const app of allApprovals) {
-    const dept = departmentsMap.get(app.department_id);
-    const source = sourcesMap.get(app.source_id);
-    const appSpecificDocs = docsList.filter(d => d.approval_id === app.id).map(d => d.document_name);
-    const combinedDocs = appSpecificDocs.length > 0 ? appSpecificDocs : (app.documents || []);
-
-    // Check industry approval default
-    const iaMapping = matchedIndustryApprovals.find(ia => ia.approval_id === app.id);
-    let applicability: "Mandatory" | "Conditional" | "May Apply" | "Not Applicable" = iaMapping ? (iaMapping.applicability_type as any) : "Conditional";
-    let reason = iaMapping?.notes || `Regulatory assessment for ${app.name} under ${dept?.name || "Competent Authority"}.`;
+  const matchedIndustryApprovals = matchingIndustry ? industryApprovals.filter((ia) => ia.industry_id === matchingIndustry.id) : [];
+  const results = [];
+  for (const app2 of allApprovals) {
+    const dept = departmentsMap.get(app2.department_id);
+    const source = sourcesMap.get(app2.source_id);
+    const appSpecificDocs = docsList.filter((d) => d.approval_id === app2.id).map((d) => d.document_name);
+    const combinedDocs = appSpecificDocs.length > 0 ? appSpecificDocs : app2.documents || [];
+    const iaMapping = matchedIndustryApprovals.find((ia) => ia.approval_id === app2.id);
+    let applicability = iaMapping ? iaMapping.applicability_type : "Conditional";
+    let reason = iaMapping?.notes || `Regulatory assessment for ${app2.name} under ${dept?.name || "Competent Authority"}.`;
     let isApplicable = false;
-
-    // Evaluate dynamic verified rules for this approval
-    const appRules = rules.filter(r => r.approval_id === app.id);
-    let matchedRule: any = null;
-
+    const appRules = rules.filter((r) => r.approval_id === app2.id);
+    let matchedRule = null;
     for (const rule of appRules) {
       let conditionMet = false;
-
       switch (rule.condition_type) {
         case "workforce_min": {
           const threshold = rule.condition_value?.workforce || 10;
@@ -3888,7 +4463,7 @@ export async function evaluateApprovalRules(inputs: {
         }
         case "stage": {
           const allowedStages = rule.condition_value?.stages || [];
-          conditionMet = allowedStages.some((s: string) => s.toLowerCase() === stage.toLowerCase());
+          conditionMet = allowedStages.some((s) => s.toLowerCase() === stage.toLowerCase());
           break;
         }
         case "midc_area": {
@@ -3901,22 +4476,19 @@ export async function evaluateApprovalRules(inputs: {
         }
         case "nature_of_biz": {
           const types = rule.condition_value?.types || [];
-          conditionMet = types.some((t: string) => (inputs.natureOfBiz || "").toLowerCase().includes(t.toLowerCase()));
+          conditionMet = types.some((t) => (inputs.natureOfBiz || "").toLowerCase().includes(t.toLowerCase()));
           break;
         }
       }
-
       if (conditionMet) {
         matchedRule = rule;
-        applicability = rule.outcome as any;
+        applicability = rule.outcome;
         reason = rule.explanation;
         break;
       }
     }
-
-    // Specific deterministic statutory logic if no rule matched
     if (!matchedRule) {
-      if (app.id === "APP-MPCB-CTE") {
+      if (app2.id === "APP-MPCB-CTE") {
         if (!normSector.includes("IT") && !normSector.includes("Software")) {
           isApplicable = true;
           applicability = "Mandatory";
@@ -3925,7 +4497,7 @@ export async function evaluateApprovalRules(inputs: {
           applicability = "Not Applicable";
           reason = "IT & Software establishments classified under White Category are exempt from CTE/CTO.";
         }
-      } else if (app.id === "APP-MPCB-CTO") {
+      } else if (app2.id === "APP-MPCB-CTO") {
         if (stage === "Pre-Operation" || stage === "Expansion" || stage === "Production Ready") {
           isApplicable = true;
           applicability = "Mandatory";
@@ -3934,7 +4506,7 @@ export async function evaluateApprovalRules(inputs: {
           applicability = "Conditional";
           reason = "Applies subsequently upon completion of civil construction and pollution control installation.";
         }
-      } else if (app.id === "APP-DISH-FACT") {
+      } else if (app2.id === "APP-DISH-FACT") {
         if (workforce >= 10 && !normSector.includes("IT")) {
           isApplicable = true;
           applicability = "Mandatory";
@@ -3947,17 +4519,15 @@ export async function evaluateApprovalRules(inputs: {
           applicability = "Not Applicable";
           reason = "Purely IT / commercial non-factory establishments are governed under Shops & Establishments Act.";
         }
-      } else if (app.id === "APP-FIRE-NOC") {
+      } else if (app2.id === "APP-FIRE-NOC") {
         isApplicable = true;
-        applicability = isHazardous ? "Mandatory" : (iaMapping ? (iaMapping.applicability_type as any) : "Mandatory");
-        reason = isHazardous
-          ? "Mandatory high-hazard fire safety NOC under Maharashtra Fire Prevention and Life Safety Measures Act 2006."
-          : "Statutory provisional fire safety clearance required prior to building plan sanction.";
-      } else if (app.id === "APP-MSEDCL-PWR") {
+        applicability = isHazardous ? "Mandatory" : iaMapping ? iaMapping.applicability_type : "Mandatory";
+        reason = isHazardous ? "Mandatory high-hazard fire safety NOC under Maharashtra Fire Prevention and Life Safety Measures Act 2006." : "Statutory provisional fire safety clearance required prior to building plan sanction.";
+      } else if (app2.id === "APP-MSEDCL-PWR") {
         isApplicable = true;
         applicability = "Mandatory";
         reason = `Essential utility power sanction (${powerKw || 50} kW) under Maharashtra Electricity Regulatory Commission Supply Code.`;
-      } else if (app.id === "APP-MIDC-BLD") {
+      } else if (app2.id === "APP-MIDC-BLD") {
         if (isMIDC) {
           isApplicable = true;
           applicability = "Mandatory";
@@ -3966,7 +4536,7 @@ export async function evaluateApprovalRules(inputs: {
           applicability = "Not Applicable";
           reason = "Non-MIDC land falls under local Municipal Corporation / District Collectorate Town Planning.";
         }
-      } else if (app.id === "APP-SEIAA-EC") {
+      } else if (app2.id === "APP-SEIAA-EC") {
         if (isHazardous || normSector.includes("Chemical") || normSector.includes("Pharma") || builtUpSqFt > 215278) {
           isApplicable = true;
           applicability = "Mandatory";
@@ -3975,8 +4545,8 @@ export async function evaluateApprovalRules(inputs: {
           applicability = "Not Applicable";
           reason = "Classified within standard manufacturing limits; exempt from prior MoEFCC/SEIAA Environmental Clearance.";
         }
-      } else if (app.id === "APP-LAB-SHOPS") {
-        if (normSector.includes("IT") || (inputs.natureOfBiz && inputs.natureOfBiz.includes("Service"))) {
+      } else if (app2.id === "APP-LAB-SHOPS") {
+        if (normSector.includes("IT") || inputs.natureOfBiz && inputs.natureOfBiz.includes("Service")) {
           isApplicable = true;
           applicability = "Mandatory";
           reason = "Statutory registration/intimation under Maharashtra Shops & Establishments Act 2017.";
@@ -3985,7 +4555,7 @@ export async function evaluateApprovalRules(inputs: {
           applicability = "May Apply";
           reason = "Applies for registered administrative corporate offices not within factory licensed boundary.";
         }
-      } else if (app.id === "APP-LAB-CONTRACT") {
+      } else if (app2.id === "APP-LAB-CONTRACT") {
         if (contractWorkers >= 20 || workforce >= 50) {
           isApplicable = true;
           applicability = "Mandatory";
@@ -3994,7 +4564,7 @@ export async function evaluateApprovalRules(inputs: {
           applicability = "Conditional";
           reason = "Conditional on engaging 20 or more contract workers through registered contractors.";
         }
-      } else if (app.id === "APP-DEMO-BOILER") {
+      } else if (app2.id === "APP-DEMO-BOILER") {
         if (hasBoiler) {
           isApplicable = true;
           applicability = "Conditional";
@@ -4007,43 +4577,38 @@ export async function evaluateApprovalRules(inputs: {
     } else {
       isApplicable = applicability !== "Not Applicable";
     }
-
     results.push({
-      id: app.id,
-      code: app.code,
-      name: app.name,
-      department: dept?.name || app.authority || "Government Authority",
+      id: app2.id,
+      code: app2.code,
+      name: app2.name,
+      department: dept?.name || app2.authority || "Government Authority",
       departmentCode: dept?.short_name || "GOV",
-      category: app.category,
+      category: app2.category,
       applicability,
       reason,
       documents: combinedDocs,
-      timeline: app.timeline || "Not specified in source",
-      fee: app.fee || "Not specified in source",
-      officialUrl: app.official_url || dept?.official_url || "https://maharashtra.gov.in",
-      legalBasis: app.legal_basis || "Relevant State / Central Statute",
+      timeline: app2.timeline || "Not specified in source",
+      fee: app2.fee || "Not specified in source",
+      officialUrl: app2.official_url || dept?.official_url || "https://maharashtra.gov.in",
+      legalBasis: app2.legal_basis || "Relevant State / Central Statute",
       source: {
-        id: source?.id || app.source_id || "SRC-REG-OFFICIAL",
+        id: source?.id || app2.source_id || "SRC-REG-OFFICIAL",
         title: source?.title || "Official Maharashtra Single Window Regulatory Repository",
         type: source?.source_type || "Government Notification",
-        url: source?.official_url || app.official_url,
+        url: source?.official_url || app2.official_url,
         lastVerifiedAt: source?.last_verified_at || null,
-        verificationStatus: app.status === "Verified" && source?.verification_status === "Verified" ? "Verified" : "Pending Verification"
+        verificationStatus: app2.status === "Verified" && source?.verification_status === "Verified" ? "Verified" : "Pending Verification"
       },
-      verificationStatus: app.status === "Verified" && source?.verification_status === "Verified" ? "Verified" : "Pending Verification"
+      verificationStatus: app2.status === "Verified" && source?.verification_status === "Verified" ? "Verified" : "Pending Verification"
     });
   }
-
-  // Sort: Mandatory first, then Conditional, then May Apply, then Not Applicable
-  const priorityOrder: Record<string, number> = {
+  const priorityOrder = {
     "Mandatory": 1,
     "Conditional": 2,
     "May Apply": 3,
     "Not Applicable": 4
   };
-
   results.sort((a, b) => (priorityOrder[a.applicability] || 5) - (priorityOrder[b.applicability] || 5));
-
   return {
     preliminary: true,
     disclaimer: "Preliminary Guidance: Requirements may vary by project specifics, zoning, and authority review. Verify the latest requirements with the relevant official authority.",
@@ -4053,8 +4618,8 @@ export async function evaluateApprovalRules(inputs: {
       district: inputs.district || "Nashik",
       taluka: inputs.taluka,
       midcArea: inputs.midcArea,
-      investment: investment,
-      workforce: workforce,
+      investment,
+      workforce,
       connectedPower: powerKw,
       projectStage: stage,
       hazardousMaterial: isHazardous
@@ -4062,86 +4627,60 @@ export async function evaluateApprovalRules(inputs: {
     approvals: results
   };
 }
-
-// 33. GET /api/regulatory/industries - List all registered industries
 app.get("/api/regulatory/industries", requireCompanyAuth, async (_req, res) => {
   try {
-    const { data, error } = await supabase
-      .from("industries")
-      .select("*, data_sources(id, title, official_url, verification_status)")
-      .order("name", { ascending: true });
-
+    const { data, error } = await supabase.from("industries").select("*, data_sources(id, title, official_url, verification_status)").order("name", { ascending: true });
     if (error) {
       return res.status(500).json({ error: error.message });
     }
-
     res.json({
       success: true,
       count: data?.length || 0,
       industries: data || []
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch industries" });
   }
 });
-
-// 34. GET /api/regulatory/departments - List all regulatory departments
 app.get("/api/regulatory/departments", requireCompanyAuth, async (_req, res) => {
   try {
-    const { data, error } = await supabase
-      .from("departments")
-      .select("*, data_sources(id, title, official_url, verification_status)")
-      .order("name", { ascending: true });
-
+    const { data, error } = await supabase.from("departments").select("*, data_sources(id, title, official_url, verification_status)").order("name", { ascending: true });
     if (error) {
       return res.status(500).json({ error: error.message });
     }
-
     res.json({
       success: true,
       count: data?.length || 0,
       departments: data || []
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch departments" });
   }
 });
-
-// 35. GET /api/regulatory/approvals - List all approvals in knowledge base (Company facing)
 app.get("/api/regulatory/approvals", requireCompanyAuth, async (req, res) => {
   try {
     const { category, departmentId, status } = req.query;
-    let query = supabase
-      .from("approvals")
-      .select("id, name, code, department_id, category, description, authority, applicability, eligibility, documents, fee, timeline, renewal_required, validity, legal_basis, official_url, status, source_id, created_at, updated_at, departments(id, name, short_name, authority), data_sources(id, title, official_url, verification_status)");
-
-    // Normal company users only see Verified or Pending Verification (exclude Rejected and Archived)
+    let query = supabase.from("approvals").select("id, name, code, department_id, category, description, authority, applicability, eligibility, documents, fee, timeline, renewal_required, validity, legal_basis, official_url, status, source_id, created_at, updated_at, departments(id, name, short_name, authority), data_sources(id, title, official_url, verification_status)");
     if (status) {
-      query = query.eq("status", status as string);
+      query = query.eq("status", status);
     } else {
       query = query.in("status", ["Verified", "Pending Verification"]);
     }
-
-    if (category) query = query.eq("category", category as string);
-    if (departmentId) query = query.eq("department_id", departmentId as string);
-
+    if (category) query = query.eq("category", category);
+    if (departmentId) query = query.eq("department_id", departmentId);
     const { data, error } = await query.order("name", { ascending: true });
-
     if (error) {
       return res.status(500).json({ error: error.message });
     }
-
     res.json({
       success: true,
       count: data?.length || 0,
       approvals: data || []
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch approvals" });
   }
 });
-
-// 36. GET /api/regulatory/approvals/:id - Get approval detail with documents and steps
 app.get("/api/regulatory/approvals/:id", requireCompanyAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -4151,20 +4690,14 @@ app.get("/api/regulatory/approvals/:id", requireCompanyAuth, async (req, res) =>
       { data: steps },
       { data: rules }
     ] = await Promise.all([
-      supabase
-        .from("approvals")
-        .select("*, departments(id, name, short_name, authority, official_url), data_sources(id, title, official_url, verification_status, last_verified_at)")
-        .eq("id", id)
-        .single(),
+      supabase.from("approvals").select("*, departments(id, name, short_name, authority, official_url), data_sources(id, title, official_url, verification_status, last_verified_at)").eq("id", id).single(),
       supabase.from("approval_documents").select("*").eq("approval_id", id),
       supabase.from("approval_steps").select("*").eq("approval_id", id).order("step_number", { ascending: true }),
       supabase.from("approval_rules").select("*").eq("approval_id", id)
     ]);
-
     if (appError || !approval || approval.status === "Archived" || approval.status === "Rejected") {
       return res.status(404).json({ error: "Approval record not found." });
     }
-
     res.json({
       success: true,
       approval: {
@@ -4174,37 +4707,27 @@ app.get("/api/regulatory/approvals/:id", requireCompanyAuth, async (req, res) =>
         rulesList: rules || []
       }
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch approval detail" });
   }
 });
-
-// 37. GET /api/regulatory/industries/:id/approvals - List mapped approvals for an industry
 app.get("/api/regulatory/industries/:id/approvals", requireCompanyAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { data, error } = await supabase
-      .from("industry_approvals")
-      .select("*, approvals(*, departments(id, name, short_name)), data_sources(id, title, official_url, verification_status)")
-      .eq("industry_id", id)
-      .order("priority", { ascending: true });
-
+    const { data, error } = await supabase.from("industry_approvals").select("*, approvals(*, departments(id, name, short_name)), data_sources(id, title, official_url, verification_status)").eq("industry_id", id).order("priority", { ascending: true });
     if (error) {
       return res.status(500).json({ error: error.message });
     }
-
     res.json({
       success: true,
       industryId: id,
       count: data?.length || 0,
       mappings: data || []
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch industry approvals" });
   }
 });
-
-// 38. POST /api/regulatory/analyze - Run Approval Applicability Rule Engine
 app.post("/api/regulatory/analyze", requireCompanyAuth, async (req, res) => {
   try {
     const analysis = await evaluateApprovalRules(req.body);
@@ -4212,32 +4735,14 @@ app.post("/api/regulatory/analyze", requireCompanyAuth, async (req, res) => {
       success: true,
       ...analysis
     });
-  } catch (err: any) {
+  } catch (err) {
     console.error("Regulatory rule engine error:", err);
     res.status(500).json({ error: err?.message || "Failed to execute regulatory analysis" });
   }
 });
-
-// =========================================================================
-// REGULATORY DATA MANAGEMENT, VERIFICATION & AUDIT APIS (STEP 9)
-// =========================================================================
-
-/**
- * Record an entry in the administrative audit log
- */
-export async function logRegulatoryAudit(params: {
-  action: "CREATE" | "UPDATE" | "VERIFY" | "REJECT" | "ARCHIVE" | "RESTORE";
-  entityType: string;
-  entityId: string;
-  previousStatus?: string;
-  newStatus?: string;
-  changedFields?: string[];
-  performedBy: string;
-  reason?: string;
-  metadata?: any;
-}) {
+async function logRegulatoryAudit(params) {
   try {
-    const auditId = `RAUD-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+    const auditId = `RAUD-${Date.now()}-${Math.floor(1e3 + Math.random() * 9e3)}`;
     await supabase.from("regulatory_audit_log").insert({
       id: auditId,
       action: params.action,
@@ -4249,40 +4754,18 @@ export async function logRegulatoryAudit(params: {
       performed_by: params.performedBy,
       reason: params.reason || null,
       metadata: params.metadata || {},
-      created_at: new Date().toISOString()
+      created_at: (/* @__PURE__ */ new Date()).toISOString()
     });
   } catch (err) {
     console.warn("Regulatory audit log notice:", err);
   }
 }
-
-/**
- * Create a new sequential version snapshot in regulatory_versions
- */
-export async function createRegulatoryVersion(params: {
-  entityType: string;
-  entityId: string;
-  changeType: "CREATE" | "UPDATE" | "VERIFY" | "REJECT" | "ARCHIVE" | "RESTORE";
-  snapshot: any;
-  changedBy: string;
-  changedFields?: string[];
-  reason?: string;
-}): Promise<number> {
+async function createRegulatoryVersion(params) {
   try {
-    // Get latest version number for this entity
-    const { data: latest } = await supabase
-      .from("regulatory_versions")
-      .select("version_number")
-      .eq("entity_type", params.entityType)
-      .eq("entity_id", params.entityId)
-      .order("version_number", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
+    const { data: latest } = await supabase.from("regulatory_versions").select("version_number").eq("entity_type", params.entityType).eq("entity_id", params.entityId).order("version_number", { ascending: false }).limit(1).maybeSingle();
     const previousVersion = latest ? Number(latest.version_number) : 0;
     const versionNumber = previousVersion + 1;
     const versionId = `RVER-${params.entityId}-V${versionNumber}`;
-
     await supabase.from("regulatory_versions").insert({
       id: versionId,
       entity_type: params.entityType,
@@ -4294,100 +4777,74 @@ export async function createRegulatoryVersion(params: {
       snapshot: params.snapshot,
       changed_by: params.changedBy,
       reason: params.reason || null,
-      created_at: new Date().toISOString()
+      created_at: (/* @__PURE__ */ new Date()).toISOString()
     });
-
     return versionNumber;
   } catch (err) {
     console.warn("Regulatory versioning notice:", err);
     return 1;
   }
 }
-
-// -------------------------------------------------------------------------
-// ADMIN APIS: DATA SOURCES
-// -------------------------------------------------------------------------
-
-// GET /api/admin/regulatory/sources
 app.get("/api/admin/regulatory/sources", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { status, department } = req.query;
     let query = supabase.from("data_sources").select("*");
-    if (status) query = query.eq("verification_status", status as string);
-    if (department) query = query.eq("department", department as string);
-
+    if (status) query = query.eq("verification_status", status);
+    if (department) query = query.eq("department", department);
     const { data, error } = await query.order("created_at", { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
-
     res.json({ success: true, count: data?.length || 0, sources: data || [] });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch sources" });
   }
 });
-
-// GET /api/admin/regulatory/sources/:id
 app.get("/api/admin/regulatory/sources/:id", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { data, error } = await supabase.from("data_sources").select("*").eq("id", id).single();
     if (error || !data) return res.status(404).json({ error: "Data source not found." });
-
     res.json({ success: true, source: data });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch data source" });
   }
 });
-
-// PUT /api/admin/regulatory/sources/:id
 app.put("/api/admin/regulatory/sources/:id", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { title, sourceType, department, officialUrl, notes, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("data_sources").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Data source not found." });
-
-    const updatePayload: Record<string, any> = {
-      updated_at: new Date().toISOString()
+    const updatePayload = {
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     };
-    const changedFields: string[] = [];
-
-    if (title !== undefined && title !== existing.title) {
+    const changedFields = [];
+    if (title !== void 0 && title !== existing.title) {
       updatePayload.title = title;
       changedFields.push("title");
     }
-    if (sourceType !== undefined && sourceType !== existing.source_type) {
+    if (sourceType !== void 0 && sourceType !== existing.source_type) {
       updatePayload.source_type = sourceType;
       changedFields.push("source_type");
     }
-    if (department !== undefined && department !== existing.department) {
+    if (department !== void 0 && department !== existing.department) {
       updatePayload.department = department;
       changedFields.push("department");
     }
-    if (officialUrl !== undefined && officialUrl !== existing.official_url) {
+    if (officialUrl !== void 0 && officialUrl !== existing.official_url) {
       updatePayload.official_url = officialUrl;
       changedFields.push("official_url");
     }
-    if (notes !== undefined && notes !== existing.notes) {
+    if (notes !== void 0 && notes !== existing.notes) {
       updatePayload.notes = notes;
       changedFields.push("notes");
     }
-    if (req.body.verification_status !== undefined && req.body.verification_status !== existing.verification_status) {
+    if (req.body.verification_status !== void 0 && req.body.verification_status !== existing.verification_status) {
       updatePayload.verification_status = req.body.verification_status;
       changedFields.push("verification_status");
     }
-
-    const { data: updated, error: updErr } = await supabase
-      .from("data_sources")
-      .update(updatePayload)
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updated, error: updErr } = await supabase.from("data_sources").update(updatePayload).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
-    // Versioning and audit
     await createRegulatoryVersion({
       entityType: "data_source",
       entityId: id,
@@ -4397,7 +4854,6 @@ app.put("/api/admin/regulatory/sources/:id", requireRegulatoryAdmin, async (req,
       changedFields,
       reason
     });
-
     await logRegulatoryAudit({
       action: "UPDATE",
       entityType: "data_source",
@@ -4408,39 +4864,27 @@ app.put("/api/admin/regulatory/sources/:id", requireRegulatoryAdmin, async (req,
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, message: "Data source updated successfully.", source: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to update source" });
   }
 });
-
-// POST /api/admin/regulatory/sources/:id/verify
 app.post("/api/admin/regulatory/sources/:id/verify", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { notes, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("data_sources").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Data source not found." });
-
-    const verifiedTimestamp = new Date().toISOString();
-    const { data: updated, error: updErr } = await supabase
-      .from("data_sources")
-      .update({
-        verification_status: "Verified",
-        last_verified_at: verifiedTimestamp,
-        verified_by: adminUser,
-        verification_notes: notes || existing.verification_notes,
-        updated_at: verifiedTimestamp
-      })
-      .eq("id", id)
-      .select()
-      .single();
-
+    const verifiedTimestamp = (/* @__PURE__ */ new Date()).toISOString();
+    const { data: updated, error: updErr } = await supabase.from("data_sources").update({
+      verification_status: "Verified",
+      last_verified_at: verifiedTimestamp,
+      verified_by: adminUser,
+      verification_notes: notes || existing.verification_notes,
+      updated_at: verifiedTimestamp
+    }).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await createRegulatoryVersion({
       entityType: "data_source",
       entityId: id,
@@ -4450,7 +4894,6 @@ app.post("/api/admin/regulatory/sources/:id/verify", requireRegulatoryAdmin, asy
       changedFields: ["verification_status", "last_verified_at", "verified_by"],
       reason
     });
-
     await logRegulatoryAudit({
       action: "VERIFY",
       entityType: "data_source",
@@ -4460,37 +4903,25 @@ app.post("/api/admin/regulatory/sources/:id/verify", requireRegulatoryAdmin, asy
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, message: "Data source verified successfully.", source: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to verify source" });
   }
 });
-
-// POST /api/admin/regulatory/sources/:id/reject
 app.post("/api/admin/regulatory/sources/:id/reject", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { notes, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("data_sources").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Data source not found." });
-
-    const { data: updated, error: updErr } = await supabase
-      .from("data_sources")
-      .update({
-        verification_status: "Rejected",
-        verified_by: adminUser,
-        verification_notes: notes || "Rejected by regulatory administrator during review",
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updated, error: updErr } = await supabase.from("data_sources").update({
+      verification_status: "Rejected",
+      verified_by: adminUser,
+      verification_notes: notes || "Rejected by regulatory administrator during review",
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await createRegulatoryVersion({
       entityType: "data_source",
       entityId: id,
@@ -4500,7 +4931,6 @@ app.post("/api/admin/regulatory/sources/:id/reject", requireRegulatoryAdmin, asy
       changedFields: ["verification_status", "verification_notes"],
       reason
     });
-
     await logRegulatoryAudit({
       action: "REJECT",
       entityType: "data_source",
@@ -4510,36 +4940,24 @@ app.post("/api/admin/regulatory/sources/:id/reject", requireRegulatoryAdmin, asy
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, message: "Data source rejected.", source: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to reject source" });
   }
 });
-
-// POST /api/admin/regulatory/sources/:id/archive
 app.post("/api/admin/regulatory/sources/:id/archive", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("data_sources").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Data source not found." });
-
-    const { data: updated, error: updErr } = await supabase
-      .from("data_sources")
-      .update({
-        verification_status: "Archived",
-        verified_by: adminUser,
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updated, error: updErr } = await supabase.from("data_sources").update({
+      verification_status: "Archived",
+      verified_by: adminUser,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await createRegulatoryVersion({
       entityType: "data_source",
       entityId: id,
@@ -4549,7 +4967,6 @@ app.post("/api/admin/regulatory/sources/:id/archive", requireRegulatoryAdmin, as
       changedFields: ["verification_status"],
       reason
     });
-
     await logRegulatoryAudit({
       action: "ARCHIVE",
       entityType: "data_source",
@@ -4559,39 +4976,25 @@ app.post("/api/admin/regulatory/sources/:id/archive", requireRegulatoryAdmin, as
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, message: "Data source archived.", source: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to archive source" });
   }
 });
-
-// -------------------------------------------------------------------------
-// ADMIN APIS: APPROVALS
-// -------------------------------------------------------------------------
-
-// GET /api/admin/regulatory/approvals
 app.get("/api/admin/regulatory/approvals", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { status, category, departmentId } = req.query;
-    let query = supabase
-      .from("approvals")
-      .select("*, departments(id, name, short_name), data_sources(id, title, verification_status)");
-
-    if (status) query = query.eq("status", status as string);
-    if (category) query = query.eq("category", category as string);
-    if (departmentId) query = query.eq("department_id", departmentId as string);
-
+    let query = supabase.from("approvals").select("*, departments(id, name, short_name), data_sources(id, title, verification_status)");
+    if (status) query = query.eq("status", status);
+    if (category) query = query.eq("category", category);
+    if (departmentId) query = query.eq("department_id", departmentId);
     const { data, error } = await query.order("created_at", { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
-
     res.json({ success: true, count: data?.length || 0, approvals: data || [] });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch admin approvals" });
   }
 });
-
-// GET /api/admin/regulatory/approvals/:id
 app.get("/api/admin/regulatory/approvals/:id", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -4600,29 +5003,21 @@ app.get("/api/admin/regulatory/approvals/:id", requireRegulatoryAdmin, async (re
       { data: versions },
       { data: auditLogs }
     ] = await Promise.all([
-      supabase
-        .from("approvals")
-        .select("*, departments(id, name, short_name, authority, official_url), data_sources(id, title, official_url, verification_status)")
-        .eq("id", id)
-        .single(),
+      supabase.from("approvals").select("*, departments(id, name, short_name, authority, official_url), data_sources(id, title, official_url, verification_status)").eq("id", id).single(),
       supabase.from("regulatory_versions").select("*").eq("entity_type", "approval").eq("entity_id", id).order("version_number", { ascending: false }),
       supabase.from("regulatory_audit_log").select("*").eq("entity_type", "approval").eq("entity_id", id).order("created_at", { ascending: false })
     ]);
-
     if (appErr || !approval) return res.status(404).json({ error: "Approval not found." });
-
     res.json({
       success: true,
       approval,
       versions: versions || [],
       auditLogs: auditLogs || []
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch approval detail" });
   }
 });
-
-// PUT /api/admin/regulatory/approvals/:id
 app.put("/api/admin/regulatory/approvals/:id", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -4644,88 +5039,76 @@ app.put("/api/admin/regulatory/approvals/:id", requireRegulatoryAdmin, async (re
       reason
     } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("approvals").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Approval not found." });
-
-    const updatePayload: Record<string, any> = {
-      updated_at: new Date().toISOString()
+    const updatePayload = {
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     };
-    const changedFields: string[] = [];
-
-    if (name !== undefined && name !== existing.name) {
+    const changedFields = [];
+    if (name !== void 0 && name !== existing.name) {
       updatePayload.name = name;
       changedFields.push("name");
     }
-    if (description !== undefined && description !== existing.description) {
+    if (description !== void 0 && description !== existing.description) {
       updatePayload.description = description;
       changedFields.push("description");
     }
-    if (category !== undefined && category !== existing.category) {
+    if (category !== void 0 && category !== existing.category) {
       updatePayload.category = category;
       changedFields.push("category");
     }
-    if (authority !== undefined && authority !== existing.authority) {
+    if (authority !== void 0 && authority !== existing.authority) {
       updatePayload.authority = authority;
       changedFields.push("authority");
     }
-    if (applicability !== undefined && applicability !== existing.applicability) {
+    if (applicability !== void 0 && applicability !== existing.applicability) {
       updatePayload.applicability = applicability;
       changedFields.push("applicability");
     }
-    if (eligibility !== undefined && eligibility !== existing.eligibility) {
+    if (eligibility !== void 0 && eligibility !== existing.eligibility) {
       updatePayload.eligibility = eligibility;
       changedFields.push("eligibility");
     }
-    if (documents !== undefined) {
+    if (documents !== void 0) {
       updatePayload.documents = Array.isArray(documents) ? documents : [];
       changedFields.push("documents");
     }
-    if (fee !== undefined) {
+    if (fee !== void 0) {
       updatePayload.fee = fee === null || fee === "" ? null : fee;
       changedFields.push("fee");
     }
-    if (timeline !== undefined) {
+    if (timeline !== void 0) {
       updatePayload.timeline = timeline === null || timeline === "" ? null : timeline;
       changedFields.push("timeline");
     }
-    if (renewalRequired !== undefined) {
+    if (renewalRequired !== void 0) {
       updatePayload.renewal_required = Boolean(renewalRequired);
       changedFields.push("renewal_required");
     }
-    if (validity !== undefined) {
+    if (validity !== void 0) {
       updatePayload.validity = validity;
       changedFields.push("validity");
     }
-    if (legalBasis !== undefined) {
+    if (legalBasis !== void 0) {
       updatePayload.legal_basis = legalBasis;
       changedFields.push("legal_basis");
     }
-    if (officialUrl !== undefined) {
+    if (officialUrl !== void 0) {
       updatePayload.official_url = officialUrl;
       changedFields.push("official_url");
     }
-    if (sourceId !== undefined) {
+    if (sourceId !== void 0) {
       updatePayload.source_id = sourceId;
       changedFields.push("source_id");
     }
-    if (req.body.status !== undefined && req.body.status !== existing.status) {
+    if (req.body.status !== void 0 && req.body.status !== existing.status) {
       updatePayload.status = req.body.status;
       changedFields.push("status");
     }
-
     const nextVer = (Number(existing.version) || 1) + 1;
     updatePayload.version = nextVer;
-
-    const { data: updated, error: updErr } = await supabase
-      .from("approvals")
-      .update(updatePayload)
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updated, error: updErr } = await supabase.from("approvals").update(updatePayload).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await createRegulatoryVersion({
       entityType: "approval",
       entityId: id,
@@ -4735,7 +5118,6 @@ app.put("/api/admin/regulatory/approvals/:id", requireRegulatoryAdmin, async (re
       changedFields,
       reason
     });
-
     await logRegulatoryAudit({
       action: "UPDATE",
       entityType: "approval",
@@ -4746,39 +5128,27 @@ app.put("/api/admin/regulatory/approvals/:id", requireRegulatoryAdmin, async (re
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, message: "Approval updated successfully.", approval: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to update approval" });
   }
 });
-
-// POST /api/admin/regulatory/approvals/:id/verify
 app.post("/api/admin/regulatory/approvals/:id/verify", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { notes, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("approvals").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Approval not found." });
-
     const nextVer = (Number(existing.version) || 1) + 1;
-    const { data: updated, error: updErr } = await supabase
-      .from("approvals")
-      .update({
-        status: "Verified",
-        verified_by: adminUser,
-        verification_notes: notes || "Statutory parameters verified by regulatory administrator",
-        version: nextVer,
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updated, error: updErr } = await supabase.from("approvals").update({
+      status: "Verified",
+      verified_by: adminUser,
+      verification_notes: notes || "Statutory parameters verified by regulatory administrator",
+      version: nextVer,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await createRegulatoryVersion({
       entityType: "approval",
       entityId: id,
@@ -4788,7 +5158,6 @@ app.post("/api/admin/regulatory/approvals/:id/verify", requireRegulatoryAdmin, a
       changedFields: ["status", "verified_by"],
       reason
     });
-
     await logRegulatoryAudit({
       action: "VERIFY",
       entityType: "approval",
@@ -4798,39 +5167,27 @@ app.post("/api/admin/regulatory/approvals/:id/verify", requireRegulatoryAdmin, a
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, message: "Approval verified successfully.", approval: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to verify approval" });
   }
 });
-
-// POST /api/admin/regulatory/approvals/:id/reject
 app.post("/api/admin/regulatory/approvals/:id/reject", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { notes, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("approvals").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Approval not found." });
-
     const nextVer = (Number(existing.version) || 1) + 1;
-    const { data: updated, error: updErr } = await supabase
-      .from("approvals")
-      .update({
-        status: "Rejected",
-        verified_by: adminUser,
-        verification_notes: notes || "Rejected during regulatory audit",
-        version: nextVer,
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updated, error: updErr } = await supabase.from("approvals").update({
+      status: "Rejected",
+      verified_by: adminUser,
+      verification_notes: notes || "Rejected during regulatory audit",
+      version: nextVer,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await createRegulatoryVersion({
       entityType: "approval",
       entityId: id,
@@ -4840,7 +5197,6 @@ app.post("/api/admin/regulatory/approvals/:id/reject", requireRegulatoryAdmin, a
       changedFields: ["status", "verification_notes"],
       reason
     });
-
     await logRegulatoryAudit({
       action: "REJECT",
       entityType: "approval",
@@ -4850,38 +5206,26 @@ app.post("/api/admin/regulatory/approvals/:id/reject", requireRegulatoryAdmin, a
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, message: "Approval marked Rejected.", approval: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to reject approval" });
   }
 });
-
-// POST /api/admin/regulatory/approvals/:id/archive
 app.post("/api/admin/regulatory/approvals/:id/archive", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("approvals").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Approval not found." });
-
     const nextVer = (Number(existing.version) || 1) + 1;
-    const { data: updated, error: updErr } = await supabase
-      .from("approvals")
-      .update({
-        status: "Archived",
-        verified_by: adminUser,
-        version: nextVer,
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updated, error: updErr } = await supabase.from("approvals").update({
+      status: "Archived",
+      verified_by: adminUser,
+      version: nextVer,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await createRegulatoryVersion({
       entityType: "approval",
       entityId: id,
@@ -4891,7 +5235,6 @@ app.post("/api/admin/regulatory/approvals/:id/archive", requireRegulatoryAdmin, 
       changedFields: ["status"],
       reason
     });
-
     await logRegulatoryAudit({
       action: "ARCHIVE",
       entityType: "approval",
@@ -4901,116 +5244,82 @@ app.post("/api/admin/regulatory/approvals/:id/archive", requireRegulatoryAdmin, 
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, message: "Approval archived.", approval: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to archive approval" });
   }
 });
-
-// -------------------------------------------------------------------------
-// ADMIN APIS: APPROVAL RULES
-// -------------------------------------------------------------------------
-
-// GET /api/admin/regulatory/rules
 app.get("/api/admin/regulatory/rules", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { status, approvalId, conditionType } = req.query;
-    let query = supabase
-      .from("approval_rules")
-      .select("*, approvals(id, name, code), data_sources(id, title, verification_status)");
-
-    if (status) query = query.eq("status", status as string);
-    if (approvalId) query = query.eq("approval_id", approvalId as string);
-    if (conditionType) query = query.eq("condition_type", conditionType as string);
-
+    let query = supabase.from("approval_rules").select("*, approvals(id, name, code), data_sources(id, title, verification_status)");
+    if (status) query = query.eq("status", status);
+    if (approvalId) query = query.eq("approval_id", approvalId);
+    if (conditionType) query = query.eq("condition_type", conditionType);
     const { data, error } = await query.order("priority", { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
-
     res.json({ success: true, count: data?.length || 0, rules: data || [] });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch rules" });
   }
 });
-
-// GET /api/admin/regulatory/rules/:id
 app.get("/api/admin/regulatory/rules/:id", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { data, error } = await supabase
-      .from("approval_rules")
-      .select("*, approvals(id, name, code), data_sources(id, title, verification_status)")
-      .eq("id", id)
-      .single();
-
+    const { data, error } = await supabase.from("approval_rules").select("*, approvals(id, name, code), data_sources(id, title, verification_status)").eq("id", id).single();
     if (error || !data) return res.status(404).json({ error: "Approval rule not found." });
-
     res.json({ success: true, rule: data });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch approval rule" });
   }
 });
-
-// PUT /api/admin/regulatory/rules/:id
 app.put("/api/admin/regulatory/rules/:id", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { conditionType, conditionOperator, conditionValue, outcome, priority, explanation, sourceId, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("approval_rules").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Approval rule not found." });
-
-    const updatePayload: Record<string, any> = {
-      updated_at: new Date().toISOString()
+    const updatePayload = {
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     };
-    const changedFields: string[] = [];
-
-    if (conditionType !== undefined) {
+    const changedFields = [];
+    if (conditionType !== void 0) {
       updatePayload.condition_type = conditionType;
       changedFields.push("condition_type");
     }
-    if (conditionOperator !== undefined) {
+    if (conditionOperator !== void 0) {
       updatePayload.condition_operator = conditionOperator;
       changedFields.push("condition_operator");
     }
-    if (conditionValue !== undefined) {
+    if (conditionValue !== void 0) {
       updatePayload.condition_value = conditionValue;
       changedFields.push("condition_value");
     }
-    if (outcome !== undefined) {
+    if (outcome !== void 0) {
       updatePayload.outcome = outcome;
       changedFields.push("outcome");
     }
-    if (priority !== undefined && !isNaN(Number(priority))) {
+    if (priority !== void 0 && !isNaN(Number(priority))) {
       updatePayload.priority = Number(priority);
       changedFields.push("priority");
     }
-    if (explanation !== undefined) {
+    if (explanation !== void 0) {
       updatePayload.explanation = explanation;
       changedFields.push("explanation");
     }
-    if (sourceId !== undefined) {
+    if (sourceId !== void 0) {
       updatePayload.source_id = sourceId;
       changedFields.push("source_id");
     }
-    if (req.body.status !== undefined && req.body.status !== existing.status) {
+    if (req.body.status !== void 0 && req.body.status !== existing.status) {
       updatePayload.status = req.body.status;
       changedFields.push("status");
     }
-
     const nextVer = (Number(existing.version) || 1) + 1;
     updatePayload.version = nextVer;
-
-    const { data: updated, error: updErr } = await supabase
-      .from("approval_rules")
-      .update(updatePayload)
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updated, error: updErr } = await supabase.from("approval_rules").update(updatePayload).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await createRegulatoryVersion({
       entityType: "approval_rule",
       entityId: id,
@@ -5020,7 +5329,6 @@ app.put("/api/admin/regulatory/rules/:id", requireRegulatoryAdmin, async (req, r
       changedFields,
       reason
     });
-
     await logRegulatoryAudit({
       action: "UPDATE",
       entityType: "approval_rule",
@@ -5031,39 +5339,27 @@ app.put("/api/admin/regulatory/rules/:id", requireRegulatoryAdmin, async (req, r
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, message: "Rule updated successfully.", rule: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to update rule" });
   }
 });
-
-// POST /api/admin/regulatory/rules/:id/verify
 app.post("/api/admin/regulatory/rules/:id/verify", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { notes, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("approval_rules").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Approval rule not found." });
-
     const nextVer = (Number(existing.version) || 1) + 1;
-    const { data: updated, error: updErr } = await supabase
-      .from("approval_rules")
-      .update({
-        status: "Verified",
-        verified_by: adminUser,
-        verification_notes: notes || "Rule condition verified against statutory circular",
-        version: nextVer,
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updated, error: updErr } = await supabase.from("approval_rules").update({
+      status: "Verified",
+      verified_by: adminUser,
+      verification_notes: notes || "Rule condition verified against statutory circular",
+      version: nextVer,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await createRegulatoryVersion({
       entityType: "approval_rule",
       entityId: id,
@@ -5073,7 +5369,6 @@ app.post("/api/admin/regulatory/rules/:id/verify", requireRegulatoryAdmin, async
       changedFields: ["status", "verified_by"],
       reason
     });
-
     await logRegulatoryAudit({
       action: "VERIFY",
       entityType: "approval_rule",
@@ -5083,39 +5378,27 @@ app.post("/api/admin/regulatory/rules/:id/verify", requireRegulatoryAdmin, async
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, message: "Rule verified and activated in applicability engine.", rule: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to verify rule" });
   }
 });
-
-// POST /api/admin/regulatory/rules/:id/reject
 app.post("/api/admin/regulatory/rules/:id/reject", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { notes, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("approval_rules").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Approval rule not found." });
-
     const nextVer = (Number(existing.version) || 1) + 1;
-    const { data: updated, error: updErr } = await supabase
-      .from("approval_rules")
-      .update({
-        status: "Rejected",
-        verified_by: adminUser,
-        verification_notes: notes || "Rejected during rule audit",
-        version: nextVer,
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updated, error: updErr } = await supabase.from("approval_rules").update({
+      status: "Rejected",
+      verified_by: adminUser,
+      verification_notes: notes || "Rejected during rule audit",
+      version: nextVer,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await createRegulatoryVersion({
       entityType: "approval_rule",
       entityId: id,
@@ -5125,7 +5408,6 @@ app.post("/api/admin/regulatory/rules/:id/reject", requireRegulatoryAdmin, async
       changedFields: ["status", "verification_notes"],
       reason
     });
-
     await logRegulatoryAudit({
       action: "REJECT",
       entityType: "approval_rule",
@@ -5135,38 +5417,26 @@ app.post("/api/admin/regulatory/rules/:id/reject", requireRegulatoryAdmin, async
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, message: "Rule rejected.", rule: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to reject rule" });
   }
 });
-
-// POST /api/admin/regulatory/rules/:id/archive
 app.post("/api/admin/regulatory/rules/:id/archive", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("approval_rules").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Approval rule not found." });
-
     const nextVer = (Number(existing.version) || 1) + 1;
-    const { data: updated, error: updErr } = await supabase
-      .from("approval_rules")
-      .update({
-        status: "Archived",
-        verified_by: adminUser,
-        version: nextVer,
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", id)
-      .select()
-      .single();
-
+    const { data: updated, error: updErr } = await supabase.from("approval_rules").update({
+      status: "Archived",
+      verified_by: adminUser,
+      version: nextVer,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await createRegulatoryVersion({
       entityType: "approval_rule",
       entityId: id,
@@ -5176,7 +5446,6 @@ app.post("/api/admin/regulatory/rules/:id/archive", requireRegulatoryAdmin, asyn
       changedFields: ["status"],
       reason
     });
-
     await logRegulatoryAudit({
       action: "ARCHIVE",
       entityType: "approval_rule",
@@ -5186,81 +5455,58 @@ app.post("/api/admin/regulatory/rules/:id/archive", requireRegulatoryAdmin, asyn
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, message: "Rule archived.", rule: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to archive rule" });
   }
 });
-
-// -------------------------------------------------------------------------
-// ADMIN APIS: VERSIONS & AUDIT LOGS
-// -------------------------------------------------------------------------
-
-// GET /api/admin/regulatory/versions
 app.get("/api/admin/regulatory/versions", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { entityType, entityId } = req.query;
     let query = supabase.from("regulatory_versions").select("*");
-    if (entityType) query = query.eq("entity_type", entityType as string);
-    if (entityId) query = query.eq("entity_id", entityId as string);
-
+    if (entityType) query = query.eq("entity_type", entityType);
+    if (entityId) query = query.eq("entity_id", entityId);
     const { data, error } = await query.order("created_at", { ascending: false }).limit(100);
     if (error) return res.status(500).json({ error: error.message });
-
     res.json({ success: true, count: data?.length || 0, versions: data || [] });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch versions" });
   }
 });
-
-// GET /api/admin/regulatory/audit-logs
 app.get("/api/admin/regulatory/audit-logs", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { entityType, entityId, action } = req.query;
     let query = supabase.from("regulatory_audit_log").select("*");
-    if (entityType) query = query.eq("entity_type", entityType as string);
-    if (entityId) query = query.eq("entity_id", entityId as string);
-    if (action) query = query.eq("action", action as string);
-
+    if (entityType) query = query.eq("entity_type", entityType);
+    if (entityId) query = query.eq("entity_id", entityId);
+    if (action) query = query.eq("action", action);
     const { data, error } = await query.order("created_at", { ascending: false }).limit(100);
     if (error) return res.status(500).json({ error: error.message });
-
     res.json({ success: true, count: data?.length || 0, logs: data || [] });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch audit logs" });
   }
 });
-
-// -------------------------------------------------------------------------
-// STEP 9 REMEDIATION: ADMIN APIS FOR MAPPINGS, DOCUMENTS & STEPS
-// -------------------------------------------------------------------------
-
-// 1. Industry Approvals Admin CRUD
 app.get("/api/admin/regulatory/industry-approvals", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { industryId, approvalId } = req.query;
     let query = supabase.from("industry_approvals").select("*, industries(id, name, sector), approvals(id, name, code)");
-    if (industryId) query = query.eq("industry_id", industryId as string);
-    if (approvalId) query = query.eq("approval_id", approvalId as string);
-
+    if (industryId) query = query.eq("industry_id", industryId);
+    if (approvalId) query = query.eq("approval_id", approvalId);
     const { data, error } = await query.order("priority", { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ success: true, count: data?.length || 0, mappings: data || [] });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch industry approvals" });
   }
 });
-
 app.post("/api/admin/regulatory/industry-approvals", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { industryId, approvalId, applicabilityType, priority, notes, sourceId, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     if (!industryId || !approvalId) {
       return res.status(400).json({ error: "industryId and approvalId are required." });
     }
-
     const mappingId = `IA-${industryId.replace("IND-", "")}-${approvalId.replace("APP-", "")}`;
     const record = {
       id: mappingId,
@@ -5272,13 +5518,11 @@ app.post("/api/admin/regulatory/industry-approvals", requireRegulatoryAdmin, asy
       source_id: sourceId || null,
       status: "Verified",
       verified_by: adminUser,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     };
-
     const { data, error } = await supabase.from("industry_approvals").upsert(record).select().single();
     if (error) return res.status(500).json({ error: error.message });
-
     await logRegulatoryAudit({
       action: "CREATE",
       entityType: "industry_approval",
@@ -5287,31 +5531,25 @@ app.post("/api/admin/regulatory/industry-approvals", requireRegulatoryAdmin, asy
       performedBy: adminUser,
       reason: reason || "Industry approval mapping registered"
     });
-
     res.status(201).json({ success: true, mapping: data });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to create industry approval mapping" });
   }
 });
-
 app.put("/api/admin/regulatory/industry-approvals/:id", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { applicabilityType, priority, notes, status, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("industry_approvals").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Industry approval mapping not found." });
-
-    const updatePayload: Record<string, any> = { updated_at: new Date().toISOString() };
+    const updatePayload = { updated_at: (/* @__PURE__ */ new Date()).toISOString() };
     if (applicabilityType) updatePayload.applicability_type = applicabilityType;
-    if (priority !== undefined) updatePayload.priority = Number(priority);
-    if (notes !== undefined) updatePayload.notes = notes;
-    if (status !== undefined) updatePayload.status = status;
-
+    if (priority !== void 0) updatePayload.priority = Number(priority);
+    if (notes !== void 0) updatePayload.notes = notes;
+    if (status !== void 0) updatePayload.status = status;
     const { data: updated, error: updErr } = await supabase.from("industry_approvals").update(updatePayload).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await logRegulatoryAudit({
       action: "UPDATE",
       entityType: "industry_approval",
@@ -5321,24 +5559,19 @@ app.put("/api/admin/regulatory/industry-approvals/:id", requireRegulatoryAdmin, 
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, mapping: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to update industry mapping" });
   }
 });
-
 app.delete("/api/admin/regulatory/industry-approvals/:id", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing } = await supabase.from("industry_approvals").select("*").eq("id", id).maybeSingle();
     if (!existing) return res.status(404).json({ error: "Mapping not found." });
-
     const { error } = await supabase.from("industry_approvals").delete().eq("id", id);
     if (error) return res.status(500).json({ error: error.message });
-
     await logRegulatoryAudit({
       action: "ARCHIVE",
       entityType: "industry_approval",
@@ -5348,55 +5581,46 @@ app.delete("/api/admin/regulatory/industry-approvals/:id", requireRegulatoryAdmi
       performedBy: adminUser,
       reason: "Industry mapping deleted by administrator"
     });
-
     res.json({ success: true, message: "Industry approval mapping removed successfully." });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to delete industry mapping" });
   }
 });
-
-// 2. Approval Documents Admin CRUD
 app.get("/api/admin/regulatory/documents", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { approvalId } = req.query;
     let query = supabase.from("approval_documents").select("*, approvals(id, name, code)");
-    if (approvalId) query = query.eq("approval_id", approvalId as string);
-
+    if (approvalId) query = query.eq("approval_id", approvalId);
     const { data, error } = await query.order("created_at", { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ success: true, count: data?.length || 0, documents: data || [] });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch approval documents" });
   }
 });
-
 app.post("/api/admin/regulatory/documents", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { approvalId, documentName, description, mandatory, notes, sourceId, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     if (!approvalId || !documentName) {
       return res.status(400).json({ error: "approvalId and documentName are required." });
     }
-
     const docId = `ADOC-${approvalId.replace("APP-", "")}-${Date.now().toString().slice(-4)}`;
     const record = {
       id: docId,
       approval_id: approvalId,
       document_name: documentName,
       description: description || null,
-      mandatory: mandatory !== undefined ? Boolean(mandatory) : true,
+      mandatory: mandatory !== void 0 ? Boolean(mandatory) : true,
       notes: notes || null,
       source_id: sourceId || null,
       status: "Verified",
       verified_by: adminUser,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     };
-
     const { data, error } = await supabase.from("approval_documents").insert(record).select().single();
     if (error) return res.status(500).json({ error: error.message });
-
     await logRegulatoryAudit({
       action: "CREATE",
       entityType: "approval_document",
@@ -5405,32 +5629,26 @@ app.post("/api/admin/regulatory/documents", requireRegulatoryAdmin, async (req, 
       performedBy: adminUser,
       reason: reason || "Approval document requirement registered"
     });
-
     res.status(201).json({ success: true, document: data });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to create approval document" });
   }
 });
-
 app.put("/api/admin/regulatory/documents/:id", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { documentName, description, mandatory, notes, status, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("approval_documents").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Document requirement not found." });
-
-    const updatePayload: Record<string, any> = { updated_at: new Date().toISOString() };
+    const updatePayload = { updated_at: (/* @__PURE__ */ new Date()).toISOString() };
     if (documentName) updatePayload.document_name = documentName;
-    if (description !== undefined) updatePayload.description = description;
-    if (mandatory !== undefined) updatePayload.mandatory = Boolean(mandatory);
-    if (notes !== undefined) updatePayload.notes = notes;
-    if (status !== undefined) updatePayload.status = status;
-
+    if (description !== void 0) updatePayload.description = description;
+    if (mandatory !== void 0) updatePayload.mandatory = Boolean(mandatory);
+    if (notes !== void 0) updatePayload.notes = notes;
+    if (status !== void 0) updatePayload.status = status;
     const { data: updated, error: updErr } = await supabase.from("approval_documents").update(updatePayload).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await logRegulatoryAudit({
       action: "UPDATE",
       entityType: "approval_document",
@@ -5440,24 +5658,19 @@ app.put("/api/admin/regulatory/documents/:id", requireRegulatoryAdmin, async (re
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, document: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to update document requirement" });
   }
 });
-
 app.delete("/api/admin/regulatory/documents/:id", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing } = await supabase.from("approval_documents").select("*").eq("id", id).maybeSingle();
     if (!existing) return res.status(404).json({ error: "Document not found." });
-
     const { error } = await supabase.from("approval_documents").delete().eq("id", id);
     if (error) return res.status(500).json({ error: error.message });
-
     await logRegulatoryAudit({
       action: "ARCHIVE",
       entityType: "approval_document",
@@ -5467,37 +5680,30 @@ app.delete("/api/admin/regulatory/documents/:id", requireRegulatoryAdmin, async 
       performedBy: adminUser,
       reason: "Document requirement deleted by administrator"
     });
-
     res.json({ success: true, message: "Approval document removed successfully." });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to delete approval document" });
   }
 });
-
-// 3. Approval Steps Admin CRUD
 app.get("/api/admin/regulatory/steps", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { approvalId } = req.query;
     let query = supabase.from("approval_steps").select("*, approvals(id, name, code)");
-    if (approvalId) query = query.eq("approval_id", approvalId as string);
-
+    if (approvalId) query = query.eq("approval_id", approvalId);
     const { data, error } = await query.order("step_number", { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json({ success: true, count: data?.length || 0, steps: data || [] });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch approval steps" });
   }
 });
-
 app.post("/api/admin/regulatory/steps", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { approvalId, stepNumber, stepName, description, officialUrl, sourceId, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
-    if (!approvalId || !stepName || stepNumber === undefined) {
+    if (!approvalId || !stepName || stepNumber === void 0) {
       return res.status(400).json({ error: "approvalId, stepName, and stepNumber are required." });
     }
-
     const stepId = `ASTEP-${approvalId.replace("APP-", "")}-${stepNumber}`;
     const record = {
       id: stepId,
@@ -5509,13 +5715,11 @@ app.post("/api/admin/regulatory/steps", requireRegulatoryAdmin, async (req, res)
       source_id: sourceId || null,
       status: "Verified",
       verified_by: adminUser,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
     };
-
     const { data, error } = await supabase.from("approval_steps").upsert(record).select().single();
     if (error) return res.status(500).json({ error: error.message });
-
     await logRegulatoryAudit({
       action: "CREATE",
       entityType: "approval_step",
@@ -5524,32 +5728,26 @@ app.post("/api/admin/regulatory/steps", requireRegulatoryAdmin, async (req, res)
       performedBy: adminUser,
       reason: reason || "Approval process step registered"
     });
-
     res.status(201).json({ success: true, step: data });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to create approval step" });
   }
 });
-
 app.put("/api/admin/regulatory/steps/:id", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { stepNumber, stepName, description, officialUrl, status, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing, error: existErr } = await supabase.from("approval_steps").select("*").eq("id", id).single();
     if (existErr || !existing) return res.status(404).json({ error: "Step not found." });
-
-    const updatePayload: Record<string, any> = { updated_at: new Date().toISOString() };
-    if (stepNumber !== undefined) updatePayload.step_number = Number(stepNumber);
+    const updatePayload = { updated_at: (/* @__PURE__ */ new Date()).toISOString() };
+    if (stepNumber !== void 0) updatePayload.step_number = Number(stepNumber);
     if (stepName) updatePayload.step_name = stepName;
-    if (description !== undefined) updatePayload.description = description;
-    if (officialUrl !== undefined) updatePayload.official_url = officialUrl;
-    if (status !== undefined) updatePayload.status = status;
-
+    if (description !== void 0) updatePayload.description = description;
+    if (officialUrl !== void 0) updatePayload.official_url = officialUrl;
+    if (status !== void 0) updatePayload.status = status;
     const { data: updated, error: updErr } = await supabase.from("approval_steps").update(updatePayload).eq("id", id).select().single();
     if (updErr) return res.status(500).json({ error: updErr.message });
-
     await logRegulatoryAudit({
       action: "UPDATE",
       entityType: "approval_step",
@@ -5559,24 +5757,19 @@ app.put("/api/admin/regulatory/steps/:id", requireRegulatoryAdmin, async (req, r
       performedBy: adminUser,
       reason
     });
-
     res.json({ success: true, step: updated });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to update step" });
   }
 });
-
 app.delete("/api/admin/regulatory/steps/:id", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     const { data: existing } = await supabase.from("approval_steps").select("*").eq("id", id).maybeSingle();
     if (!existing) return res.status(404).json({ error: "Step not found." });
-
     const { error } = await supabase.from("approval_steps").delete().eq("id", id);
     if (error) return res.status(500).json({ error: error.message });
-
     await logRegulatoryAudit({
       action: "ARCHIVE",
       entityType: "approval_step",
@@ -5586,52 +5779,39 @@ app.delete("/api/admin/regulatory/steps/:id", requireRegulatoryAdmin, async (req
       performedBy: adminUser,
       reason: "Approval step deleted by administrator"
     });
-
     res.json({ success: true, message: "Approval step removed successfully." });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to delete step" });
   }
 });
-
-// -------------------------------------------------------------------------
-// STEP 10: OFFICIAL REGULATORY INGESTION & DATA QUALITY ENGINE APIS
-// -------------------------------------------------------------------------
-
-const ingestionEngine = new RegulatoryIngestionEngine(supabase);
-
-// POST /api/admin/regulatory/ingest/preview - Ingestion Preview without persistence
+var ingestionEngine = new RegulatoryIngestionEngine(supabase);
 app.post("/api/admin/regulatory/ingest/preview", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { source, approvals } = req.body;
     if (!source || !approvals) {
       return res.status(400).json({ error: "Source and approvals payload are required for preview." });
     }
-
     const preview = await ingestionEngine.previewIngestion({ source, approvals });
     res.json({
       success: true,
       preview
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to generate ingestion preview" });
   }
 });
-
-// POST /api/admin/regulatory/ingest/validate - Run validation on source & candidates
 app.post("/api/admin/regulatory/ingest/validate", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { source, approvals } = req.body;
     if (!source || !approvals) {
       return res.status(400).json({ error: "Source and approvals payload are required for validation." });
     }
-
     const preview = await ingestionEngine.previewIngestion({ source, approvals });
     const hasErrors = !preview.source.valid || preview.summary.validationErrorsCount > 0;
-
     res.json({
       valid: !hasErrors,
       sourceValidation: preview.source,
-      approvalValidations: preview.approvals.map(a => ({
+      approvalValidations: preview.approvals.map((a) => ({
         code: a.candidate.code,
         name: a.candidate.name,
         validation: a.validation,
@@ -5639,27 +5819,22 @@ app.post("/api/admin/regulatory/ingest/validate", requireRegulatoryAdmin, async 
       })),
       summary: preview.summary
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to validate ingestion payload" });
   }
 });
-
-// POST /api/admin/regulatory/ingest/import - Execute import into Pending Verification state
 app.post("/api/admin/regulatory/ingest/import", requireRegulatoryAdmin, async (req, res) => {
   try {
     const { source, approvals, reason } = req.body;
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
-
     if (!source || !approvals || !Array.isArray(approvals) || approvals.length === 0) {
       return res.status(400).json({ error: "Source and non-empty approvals array are required for import." });
     }
-
     const result = await ingestionEngine.importIngestion(
       { source, approvals, adminUser, reason },
       createRegulatoryVersion,
       logRegulatoryAudit
     );
-
     res.status(201).json({
       success: true,
       message: `Ingestion completed. Imported ${result.importedApprovals.length} approvals into Pending Verification.`,
@@ -5669,12 +5844,10 @@ app.post("/api/admin/regulatory/ingest/import", requireRegulatoryAdmin, async (r
       importedApprovals: result.importedApprovals,
       skippedApprovals: result.skippedApprovals
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to execute ingestion import" });
   }
 });
-
-// GET /api/admin/regulatory/quality - Overview of Data Quality Metrics
 app.get("/api/admin/regulatory/quality", requireRegulatoryAdmin, async (_req, res) => {
   try {
     const audit = await ingestionEngine.runQualityAudit();
@@ -5682,12 +5855,10 @@ app.get("/api/admin/regulatory/quality", requireRegulatoryAdmin, async (_req, re
       success: true,
       qualityMetrics: audit
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch quality metrics" });
   }
 });
-
-// GET /api/admin/regulatory/duplicates - Scan for potential duplicates
 app.get("/api/admin/regulatory/duplicates", requireRegulatoryAdmin, async (_req, res) => {
   try {
     const audit = await ingestionEngine.runQualityAudit();
@@ -5696,53 +5867,34 @@ app.get("/api/admin/regulatory/duplicates", requireRegulatoryAdmin, async (_req,
       count: audit.potentialDuplicates.length,
       duplicates: audit.potentialDuplicates
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch duplicate report" });
   }
 });
-
-// GET /api/admin/regulatory/conflicts - Unresolved conflict scan
 app.get("/api/admin/regulatory/conflicts", requireRegulatoryAdmin, async (_req, res) => {
   try {
-    const { data: auditLogs } = await supabase
-      .from("regulatory_audit_log")
-      .select("*")
-      .in("action", ["REJECT", "CONFLICT_DETECTED"])
-      .order("created_at", { ascending: false })
-      .limit(50);
-
+    const { data: auditLogs } = await supabase.from("regulatory_audit_log").select("*").in("action", ["REJECT", "CONFLICT_DETECTED"]).order("created_at", { ascending: false }).limit(50);
     res.json({
       success: true,
       count: auditLogs?.length || 0,
       conflicts: auditLogs || []
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch conflicts" });
   }
 });
-
-// GET /api/admin/regulatory/ingest/history - Batch ingestion history
 app.get("/api/admin/regulatory/ingest/history", requireRegulatoryAdmin, async (_req, res) => {
   try {
-    const { data: history } = await supabase
-      .from("regulatory_audit_log")
-      .select("*")
-      .eq("action", "CREATE")
-      .in("entity_type", ["data_source", "approval"])
-      .order("created_at", { ascending: false })
-      .limit(100);
-
+    const { data: history } = await supabase.from("regulatory_audit_log").select("*").eq("action", "CREATE").in("entity_type", ["data_source", "approval"]).order("created_at", { ascending: false }).limit(100);
     res.json({
       success: true,
       count: history?.length || 0,
       history: history || []
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch ingestion history" });
   }
 });
-
-// GET /api/admin/regulatory/overview - High level regulatory overview
 app.get("/api/admin/regulatory/overview", requireRegulatoryAdmin, async (_req, res) => {
   try {
     const [sourcesRes, approvalsRes, rulesRes] = await Promise.all([
@@ -5751,11 +5903,10 @@ app.get("/api/admin/regulatory/overview", requireRegulatoryAdmin, async (_req, r
       supabase.from("approval_rules").select("id, status")
     ]);
     const totalSources = sourcesRes.data?.length || 0;
-    const verifiedSources = (sourcesRes.data || []).filter(s => s.verification_status === "Verified").length;
+    const verifiedSources = (sourcesRes.data || []).filter((s) => s.verification_status === "Verified").length;
     const totalApprovals = approvalsRes.data?.length || 0;
-    const publishedApprovals = (approvalsRes.data || []).filter(a => a.status === "Published" || a.status === "Verified").length;
+    const publishedApprovals = (approvalsRes.data || []).filter((a) => a.status === "Published" || a.status === "Verified").length;
     const totalRules = rulesRes.data?.length || 0;
-
     res.json({
       success: true,
       overview: {
@@ -5766,12 +5917,10 @@ app.get("/api/admin/regulatory/overview", requireRegulatoryAdmin, async (_req, r
         totalRules
       }
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to fetch regulatory overview" });
   }
 });
-
-// POST /api/admin/regulatory/ingest - Generic batch ingestion alias
 app.post("/api/admin/regulatory/ingest", requireRegulatoryAdmin, async (req, res) => {
   try {
     const adminUser = req.authenticatedEmail || req.authenticatedRole || "REGULATORY_ADMIN";
@@ -5781,7 +5930,7 @@ app.post("/api/admin/regulatory/ingest", requireRegulatoryAdmin, async (req, res
       department: "General Administration",
       officialUrl: "https://maharashtra.gov.in"
     };
-    const approvals = Array.isArray(req.body.approvals) ? req.body.approvals : (Array.isArray(req.body.dataset) ? req.body.dataset : null);
+    const approvals = Array.isArray(req.body.approvals) ? req.body.approvals : Array.isArray(req.body.dataset) ? req.body.dataset : null;
     if (!approvals || approvals.length === 0) {
       return res.status(400).json({ error: "Invalid dataset provided. Must be an array of approvals." });
     }
@@ -5797,46 +5946,37 @@ app.post("/api/admin/regulatory/ingest", requireRegulatoryAdmin, async (req, res
       importedApprovals: result.importedApprovals,
       skippedApprovals: result.skippedApprovals
     });
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message || "Failed to execute regulatory ingestion" });
   }
 });
-
-// 39. Dynamic AI Regulatory Checklist & Risk Analyzer Endpoint (Hybrid AI + Knowledge Engine)
 app.post("/api/ai/regulatory-analysis", async (req, res) => {
   try {
-    const { 
-      businessName, 
-      sector, 
-      state, 
+    const {
+      businessName,
+      sector,
+      state,
       district,
-      investmentCrores, 
-      workforce, 
-      powerKw, 
-      isHazardous, 
-      landCategory 
+      investmentCrores,
+      workforce,
+      powerKw,
+      isHazardous,
+      landCategory
     } = req.body;
-
     const isMaha = !state || state.toLowerCase().includes("maha");
     const spcbName = isMaha ? "Maharashtra Pollution Control Board (MPCB)" : `State Pollution Control Board (${state || "SPCB"})`;
     const discomName = isMaha ? "Maharashtra State Electricity Distribution Co. (MSEDCL)" : `State Electricity Distribution Co. (${state || "DISCOM"})`;
     const dishName = isMaha ? "Directorate of Industrial Safety & Health (DISH Maharashtra)" : "Directorate of Industrial Safety & Health (DISH)";
     const fireName = isMaha ? "Maharashtra Fire Services & MIDC Fire Dept" : "Fire & Emergency Services";
-    const townName = (landCategory && landCategory.includes("Industrial Park")) 
-      ? (isMaha ? "MIDC Industrial Area Development Authority" : "Industrial Area Development Authority")
-      : "Urban Local Body / Town & Country Planning";
-
+    const townName = landCategory && landCategory.includes("Industrial Park") ? isMaha ? "MIDC Industrial Area Development Authority" : "Industrial Area Development Authority" : "Urban Local Body / Town & Country Planning";
     const ai = getAIClient();
-
     if (!ai) {
       const isRed = isHazardous || sector?.includes("Pharma") || sector?.includes("Chemical");
       const isWhite = sector?.includes("IT") || sector?.includes("Software") || sector?.includes("Solar");
-      const polCat = isRed ? "Red Category" : (isWhite ? "White Category" : (powerKw > 250 || investmentCrores > 10 ? "Orange Category" : "Green Category"));
-      const riskTier = isRed ? "HIGH RISK (Detailed Multi-Officer Scrutiny)" : (investmentCrores > 25 ? "MEDIUM RISK" : "LOW RISK (Green Channel Fast-Track)");
+      const polCat = isRed ? "Red Category" : isWhite ? "White Category" : powerKw > 250 || investmentCrores > 10 ? "Orange Category" : "Green Category";
+      const riskTier = isRed ? "HIGH RISK (Detailed Multi-Officer Scrutiny)" : investmentCrores > 25 ? "MEDIUM RISK" : "LOW RISK (Green Channel Fast-Track)";
       const fastTrack = !isRed && investmentCrores <= 25;
-
-      const keyClearances: any[] = [];
-
+      const keyClearances = [];
       if (!isWhite) {
         keyClearances.push({
           department: spcbName,
@@ -5846,7 +5986,6 @@ app.post("/api/ai/regulatory-analysis", async (req, res) => {
           reason: `Mandatory under Water (Prevention & Control of Pollution) Act 1974 for ${sector || "Manufacturing"} in ${district || "Industrial Zone"}.`
         });
       }
-
       keyClearances.push({
         department: fireName,
         approvalName: "Provisional Fire Safety No Objection Certificate (NOC)",
@@ -5854,7 +5993,6 @@ app.post("/api/ai/regulatory-analysis", async (req, res) => {
         criticality: "High",
         reason: "Mandatory under National Building Code (NBC 2016 Part IV) before civil work commencement."
       });
-
       if ((workforce || 0) >= 10 && !isWhite) {
         keyClearances.push({
           department: dishName,
@@ -5864,52 +6002,42 @@ app.post("/api/ai/regulatory-analysis", async (req, res) => {
           reason: `Statutory requirement under Factories Act 1948 as employee count (${workforce}) exceeds threshold with power.`
         });
       }
-
       keyClearances.push({
         department: discomName,
-        approvalName: (powerKw || 0) >= 100 
-          ? `High Tension (HT 11kV/33kV) Power Load Sanction (${powerKw} kW)`
-          : `Low Tension (LT Industrial) Power Sanction (${powerKw} kW)`,
+        approvalName: (powerKw || 0) >= 100 ? `High Tension (HT 11kV/33kV) Power Load Sanction (${powerKw} kW)` : `Low Tension (LT Industrial) Power Sanction (${powerKw} kW)`,
         slaDays: (powerKw || 0) >= 100 ? 12 : 7,
         criticality: "Medium",
         reason: `Requested connected industrial load sanction of ${powerKw || 50} kW in ${district || "District"}.`
       });
-
       keyClearances.push({
         department: townName,
-        approvalName: landCategory?.includes("Agricultural") 
-          ? "Change of Land Use (CLU) & Non-Agricultural (NA) Permission"
-          : "Industrial Building Plan Sanction & Commencement Certificate",
+        approvalName: landCategory?.includes("Agricultural") ? "Change of Land Use (CLU) & Non-Agricultural (NA) Permission" : "Industrial Building Plan Sanction & Commencement Certificate",
         slaDays: landCategory?.includes("Agricultural") ? 30 : 15,
         criticality: "High",
         reason: `Verification for ${landCategory || "Industrial Area"} master plan zoning compliance.`
       });
-
       return res.json({
         success: true,
         source: "engine-rules",
-        summary: `Dynamic statutory regulatory assessment for ${businessName || "Registered Enterprise"} in ${sector || "Manufacturing"} (${district || "Nashik"}, ${state || "Maharashtra"}). Investment: ₹${investmentCrores} Cr, Workforce: ${workforce}, Power: ${powerKw} kW.`,
+        summary: `Dynamic statutory regulatory assessment for ${businessName || "Registered Enterprise"} in ${sector || "Manufacturing"} (${district || "Nashik"}, ${state || "Maharashtra"}). Investment: \u20B9${investmentCrores} Cr, Workforce: ${workforce}, Power: ${powerKw} kW.`,
         pollutionCategory: polCat,
-        riskTier: riskTier,
+        riskTier,
         fastTrackEligible: fastTrack,
-        statutoryDays: isRed ? 45 : (fastTrack ? 15 : 21),
+        statutoryDays: isRed ? 45 : fastTrack ? 15 : 21,
         keyClearances,
         aiRecommendations: [
           "Leverage the Single Document Vault: upload Land Title and GST Certificate once to auto-populate all department dossiers.",
           "Opt for Joint Digital Site Inspection: Fire and Factories department can execute a synchronized single visit to avoid separate scheduling delays.",
-          fastTrack 
-            ? "Qualifies for Green Channel Self-Certification for initial construction mobilization under state Single Window Act." 
-            : "Prepare Hazardous Chemical Storage layout as per Manufacture, Storage and Import of Hazardous Chemical Rules."
+          fastTrack ? "Qualifies for Green Channel Self-Certification for initial construction mobilization under state Single Window Act." : "Prepare Hazardous Chemical Storage layout as per Manufacture, Storage and Import of Hazardous Chemical Rules."
         ]
       });
     }
-
     const prompt = `You are the lead regulatory advisor for India's National Single Window & Maharashtra Single Window clearance framework.
 Analyze the following business venture profile:
 - Business Name: ${businessName || "Registered Enterprise"}
 - Sector / Industry: ${sector}
 - State & District: ${state || "Maharashtra"}, ${district || "Nashik"}
-- Project Capital Investment: ₹${investmentCrores} Crores
+- Project Capital Investment: \u20B9${investmentCrores} Crores
 - Projected Workforce: ${workforce} employees
 - Connected Power Requirement: ${powerKw} kW
 - Handles Hazardous / Flammable Materials: ${isHazardous ? "YES" : "NO"}
@@ -5933,29 +6061,27 @@ Provide an accurate, dynamic regulatory clearance breakdown tailored strictly to
   ],
   "aiRecommendations": ["Actionable compliance shortcut 1", "Risk mitigation 2", "Document tip 3"]
 }`;
-
     const response = await ai.models.generateContent({
       model: "gemini-3.8-flash",
       contents: prompt,
       config: {
-        responseMimeType: "application/json",
-      },
+        responseMimeType: "application/json"
+      }
     });
-
     const parsed = JSON.parse(response.text || "{}");
     return res.json({
       success: true,
       source: "gemini-3.8-flash",
-      ...parsed,
+      ...parsed
     });
-  } catch (error: any) {
+  } catch (error) {
     console.warn("AI regulatory analysis fallback active:", error?.message);
     const { businessName, sector, state, district, investmentCrores, workforce, powerKw, isHazardous, landCategory } = req.body;
     return res.json({
       success: true,
       source: "intelligent-engine",
-      summary: `Automated Regulatory Clearance Profile for ${businessName || "Enterprise"} in ${sector || "Engineering"} (${district || "Nashik"}, ${state || "Maharashtra"}). Capital: ₹${investmentCrores || 18.5} Cr, Power: ${powerKw || 350} kW.`,
-      pollutionCategory: isHazardous ? "Red Category" : ((investmentCrores && investmentCrores > 15) ? "Orange Category" : "Green Category"),
+      summary: `Automated Regulatory Clearance Profile for ${businessName || "Enterprise"} in ${sector || "Engineering"} (${district || "Nashik"}, ${state || "Maharashtra"}). Capital: \u20B9${investmentCrores || 18.5} Cr, Power: ${powerKw || 350} kW.`,
+      pollutionCategory: isHazardous ? "Red Category" : investmentCrores && investmentCrores > 15 ? "Orange Category" : "Green Category",
       riskTier: isHazardous ? "HIGH RISK (Multi-Department Technical Scrutiny)" : "LOW RISK (Green Channel Fast-Track)",
       fastTrackEligible: !isHazardous,
       statutoryDays: isHazardous ? 30 : 15,
@@ -6004,16 +6130,12 @@ Provide an accurate, dynamic regulatory clearance breakdown tailored strictly to
     });
   }
 });
-
-// 8. AI Document Pre-Validation Assistant
 app.post("/api/ai/prevalidate-document", async (req, res) => {
   try {
     const { docType, fileName, extractedText, applicantName, companyGst } = req.body;
     const ai = getAIClient();
-
     if (!ai) {
       const hasIssues = !fileName || fileName.toLowerCase().includes("draft") || fileName.toLowerCase().includes("untitled");
-      
       return res.json({
         success: true,
         docType,
@@ -6031,12 +6153,9 @@ app.post("/api/ai/prevalidate-document", async (req, res) => {
           "Document appears to be an unfinalized draft version without formal attestation.",
           "Structural Engineer seal missing on page 2."
         ] : [],
-        correctionGuidance: hasIssues 
-          ? "Please upload the officially signed final copy bearing the registered Architect / Chartered Engineer certification stamp."
-          : "Pre-validation passed with zero compliance defects! Reusable document is ready for instant multi-department dossier injection into Single Document Vault."
+        correctionGuidance: hasIssues ? "Please upload the officially signed final copy bearing the registered Architect / Chartered Engineer certification stamp." : "Pre-validation passed with zero compliance defects! Reusable document is ready for instant multi-department dossier injection into Single Document Vault."
       });
     }
-
     const prompt = `You are an automated Government Document Scrutiny Assistant for business licenses.
 Validate the following document submission:
 - Document Type: ${docType}
@@ -6056,24 +6175,22 @@ Evaluate whether it is valid, complete, or missing mandatory clauses. Return JSO
   "missingOrInvalidItems": ["Issue 1 if any"],
   "correctionGuidance": "Clear, friendly step-by-step guidance for the business applicant"
 }`;
-
     const response = await ai.models.generateContent({
       model: "gemini-3.8-flash",
       contents: prompt,
       config: {
-        responseMimeType: "application/json",
-      },
+        responseMimeType: "application/json"
+      }
     });
-
     const parsed = JSON.parse(response.text || "{}");
     return res.json({
       success: true,
       source: "gemini-3.8-flash",
       docType,
       fileName,
-      ...parsed,
+      ...parsed
     });
-  } catch (error: any) {
+  } catch (error) {
     console.warn("Document prevalidation fallback active:", error?.message);
     const { docType, fileName, applicantName } = req.body;
     return res.json({
@@ -6095,26 +6212,30 @@ Evaluate whether it is valid, complete, or missing mandatory clauses. Return JSO
     });
   }
 });
-
-// 9. AI Query Resolution & Auto-Drafting Assistant
 app.post("/api/ai/query-assistant", async (req, res) => {
   try {
     const { department, approvalName, queryText, applicantContext } = req.body;
     const ai = getAIClient();
-
     if (!ai) {
       return res.json({
         success: true,
         summary: `Clarification for ${department} regarding ${approvalName}`,
         explanation: "Scrutiny officer requested clarification on technical drawings and electrical load ratings.",
-        suggestedResponse: `To: Scrutiny Officer, ${department}\nSubject: Clarification on Application Ref: ${approvalName}\n\nDear Sir/Madam,\nWith reference to the query raised regarding engineering specifications, we confirm that our proposed installation adheres strictly to standard statutory guidelines. We have attached the revised layout endorsed by our certified chartered engineer.\n\nRespectfully,\nAuthorized Signatory\n${applicantContext || "Western Maharashtra Engineering Private Limited"}`,
+        suggestedResponse: `To: Scrutiny Officer, ${department}
+Subject: Clarification on Application Ref: ${approvalName}
+
+Dear Sir/Madam,
+With reference to the query raised regarding engineering specifications, we confirm that our proposed installation adheres strictly to standard statutory guidelines. We have attached the revised layout endorsed by our certified chartered engineer.
+
+Respectfully,
+Authorized Signatory
+${applicantContext || "Western Maharashtra Engineering Private Limited"}`,
         attachedResolutions: [
           "Upload Revised Technical Drawing / Layout Plan",
           "Attach Certified Engineer Compliance Endorsement"
         ]
       });
     }
-
     const prompt = `A government scrutiny officer from ${department} has raised the following official query on business approval '${approvalName}':
 "${queryText}"
 
@@ -6128,21 +6249,19 @@ Return JSON:
   "suggestedResponse": "Formal, courteous letter draft ready to submit to the scrutiny portal",
   "attachedResolutions": ["Action 1 / document to attach", "Action 2 to complete"]
 }`;
-
     const response = await ai.models.generateContent({
       model: "gemini-3.8-flash",
       contents: prompt,
       config: {
-        responseMimeType: "application/json",
-      },
+        responseMimeType: "application/json"
+      }
     });
-
     const parsed = JSON.parse(response.text || "{}");
     return res.json({
       success: true,
-      ...parsed,
+      ...parsed
     });
-  } catch (error: any) {
+  } catch (error) {
     console.warn("AI query assistant fallback active:", error?.message);
     const { department, approvalName, queryText, applicantContext } = req.body;
     return res.json({
@@ -6150,7 +6269,15 @@ Return JSON:
       source: "intelligent-engine",
       summary: `Statutory clarification regarding ${approvalName} requested by ${department}`,
       explanation: `Observation regarding technical specifications: "${queryText || "Technical clarification requested"}".`,
-      suggestedResponse: `To: Scrutiny Officer, ${department || "Department"}\nSubject: Compliance Response for ${approvalName || "Statutory Approval"}\n\nDear Sir/Madam,\nWith reference to the scrutiny observation regarding technical compliance, we have reviewed the requirements under relevant statutory standards. The engineering revisions have been updated by our certified chartered engineer and appended herewith.\n\nRespectfully,\nAuthorized Signatory\n${applicantContext || "Western Maharashtra Engineering Private Limited"}`,
+      suggestedResponse: `To: Scrutiny Officer, ${department || "Department"}
+Subject: Compliance Response for ${approvalName || "Statutory Approval"}
+
+Dear Sir/Madam,
+With reference to the scrutiny observation regarding technical compliance, we have reviewed the requirements under relevant statutory standards. The engineering revisions have been updated by our certified chartered engineer and appended herewith.
+
+Respectfully,
+Authorized Signatory
+${applicantContext || "Western Maharashtra Engineering Private Limited"}`,
       attachedResolutions: [
         "Attach Certified Engineer Endorsement Letter",
         "Upload Revised Technical Specification Annexure to Single Document Vault"
@@ -6158,30 +6285,17 @@ Return JSON:
     });
   }
 });
-
-// ============================================================================
-// STEP 11: NOTIFICATIONS, SLA MONITORING & ESCALATION ENGINE REST APIS
-// ============================================================================
-
-// 1. Get Company Notifications (Paginated with filtering)
 app.get("/api/notifications", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
-    const page = Math.max(1, parseInt(req.query.page as string) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 20));
+    const companyId = req.authenticatedCompanyId;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
     const offset = (page - 1) * limit;
-
     const isReadParam = req.query.is_read;
-    const typeParam = req.query.type as string;
-    const severityParam = req.query.severity as string;
-
-    let query = supabase
-      .from("notifications")
-      .select("*", { count: "exact" })
-      .eq("company_id", companyId)
-      .order("created_at", { ascending: false });
-
-    if (isReadParam !== undefined && isReadParam !== "") {
+    const typeParam = req.query.type;
+    const severityParam = req.query.severity;
+    let query = supabase.from("notifications").select("*", { count: "exact" }).eq("company_id", companyId).order("created_at", { ascending: false });
+    if (isReadParam !== void 0 && isReadParam !== "") {
       query = query.eq("is_read", isReadParam === "true");
     }
     if (typeParam) {
@@ -6190,20 +6304,11 @@ app.get("/api/notifications", requireCompanyAuth, async (req, res) => {
     if (severityParam) {
       query = query.eq("severity", severityParam);
     }
-
     const { data: notifications, count, error } = await query.range(offset, offset + limit - 1);
-
     if (error) {
       return res.status(500).json({ error: `Failed to fetch notifications: ${error.message}` });
     }
-
-    // Also get unread count
-    const { count: unreadCount } = await supabase
-      .from("notifications")
-      .select("id", { count: "exact", head: true })
-      .eq("company_id", companyId)
-      .eq("is_read", false);
-
+    const { count: unreadCount } = await supabase.from("notifications").select("id", { count: "exact", head: true }).eq("company_id", companyId).eq("is_read", false);
     return res.json({
       success: true,
       notifications: notifications || [],
@@ -6211,118 +6316,81 @@ app.get("/api/notifications", requireCompanyAuth, async (req, res) => {
         page,
         limit,
         total: count || 0,
-        totalPages: Math.ceil((count || 0) / limit),
+        totalPages: Math.ceil((count || 0) / limit)
       },
       unreadCount: unreadCount || 0
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 2. Get Unread Notifications Count
 app.get("/api/notifications/unread-count", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
-    const { count, error } = await supabase
-      .from("notifications")
-      .select("id", { count: "exact", head: true })
-      .eq("company_id", companyId)
-      .eq("is_read", false);
-
+    const companyId = req.authenticatedCompanyId;
+    const { count, error } = await supabase.from("notifications").select("id", { count: "exact", head: true }).eq("company_id", companyId).eq("is_read", false);
     if (error) {
       return res.status(500).json({ error: `Failed to count unread notifications: ${error.message}` });
     }
-
     return res.json({
       success: true,
       unreadCount: count || 0
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 3. Get Notification Preferences (Must precede /:id)
 app.get("/api/notifications/preferences", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const prefs = await slaEngine.getCompanyPreferences(companyId);
     return res.json({
       success: true,
       preferences: prefs
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 4. Update Notification Preferences (Must precede /:id)
 app.put("/api/notifications/preferences", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const updatedPrefs = await slaEngine.updateCompanyPreferences(companyId, req.body);
     return res.json({
       success: true,
       preferences: updatedPrefs
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 5. Mark All Notifications as Read for Authenticated Company (Must precede /:id)
 app.put("/api/notifications/read-all", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
-
-    const { error } = await supabase
-      .from("notifications")
-      .update({
-        is_read: true,
-        read_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .eq("company_id", companyId)
-      .eq("is_read", false);
-
+    const companyId = req.authenticatedCompanyId;
+    const { error } = await supabase.from("notifications").update({
+      is_read: true,
+      read_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("company_id", companyId).eq("is_read", false);
     if (error) {
       return res.status(500).json({ error: `Failed to mark notifications as read: ${error.message}` });
     }
-
     return res.json({
       success: true,
       message: "All notifications marked as read."
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 6. Get Single Notification by ID (with delivery audit)
 app.get("/api/notifications/:id", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const notificationId = req.params.id;
-
-    const { data: notification, error } = await supabase
-      .from("notifications")
-      .select("*")
-      .eq("id", notificationId)
-      .eq("company_id", companyId)
-      .maybeSingle();
-
+    const { data: notification, error } = await supabase.from("notifications").select("*").eq("id", notificationId).eq("company_id", companyId).maybeSingle();
     if (error || !notification) {
       return res.status(404).json({ error: "Notification not found or access denied." });
     }
-
-    // Fetch delivery logs for this notification
-    const { data: deliveries } = await supabase
-      .from("notification_deliveries")
-      .select("*")
-      .eq("notification_id", notificationId)
-      .order("created_at", { ascending: true });
-
+    const { data: deliveries } = await supabase.from("notification_deliveries").select("*").eq("notification_id", notificationId).order("created_at", { ascending: true });
     return res.json({
       success: true,
       notification: {
@@ -6330,172 +6398,128 @@ app.get("/api/notifications/:id", requireCompanyAuth, async (req, res) => {
         deliveries: deliveries || []
       }
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 7. Mark Single Notification as Read
 app.put("/api/notifications/:id/read", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const notificationId = req.params.id;
-
-    const { data: updated, error } = await supabase
-      .from("notifications")
-      .update({
-        is_read: true,
-        read_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", notificationId)
-      .eq("company_id", companyId)
-      .select("*")
-      .maybeSingle();
-
+    const { data: updated, error } = await supabase.from("notifications").update({
+      is_read: true,
+      read_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("id", notificationId).eq("company_id", companyId).select("*").maybeSingle();
     if (error || !updated) {
       return res.status(404).json({ error: "Notification not found or update failed." });
     }
-
     return res.json({
       success: true,
       notification: updated
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 8. Delete Notification
 app.delete("/api/notifications/:id", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
+    const companyId = req.authenticatedCompanyId;
     const notificationId = req.params.id;
-
-    const { data: deleted, error } = await supabase
-      .from("notifications")
-      .delete()
-      .eq("id", notificationId)
-      .eq("company_id", companyId)
-      .select("id")
-      .maybeSingle();
-
+    const { data: deleted, error } = await supabase.from("notifications").delete().eq("id", notificationId).eq("company_id", companyId).select("id").maybeSingle();
     if (error || !deleted) {
       return res.status(404).json({ error: "Notification not found or already deleted." });
     }
-
     return res.json({
       success: true,
       message: "Notification deleted successfully."
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 9. Get Applications SLA Status and Monitoring Overview
 app.get("/api/sla/applications", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
-    const { data: apps, error } = await supabase
-      .from("applications")
-      .select("*")
-      .eq("company_id", companyId);
-
+    const companyId = req.authenticatedCompanyId;
+    const { data: apps, error } = await supabase.from("applications").select("*").eq("company_id", companyId);
     if (error) {
       return res.status(500).json({ error: `Failed to fetch applications: ${error.message}` });
     }
-
-    const items = (apps || []).map((app: any) => {
-      const startTimestamp = app.submitted_date || app.applied_date || app.created_at;
-      const sla = slaEngine.calculateSlaStatus(startTimestamp, app.sla_days, app.status);
+    const items = (apps || []).map((app2) => {
+      const startTimestamp = app2.submitted_date || app2.applied_date || app2.created_at;
+      const sla = slaEngine.calculateSlaStatus(startTimestamp, app2.sla_days, app2.status);
       return {
-        ...dbToApprovalItem(app),
+        ...dbToApprovalItem(app2),
         sla
       };
     });
-
     return res.json({
       success: true,
       applications: items,
       summary: {
         total: items.length,
-        breached: items.filter((i: any) => i.sla.isBreached).length,
-        warning: items.filter((i: any) => i.sla.isWarning).length,
-        dueToday: items.filter((i: any) => i.sla.isDueToday).length,
-        normal: items.filter((i: any) => i.sla.escalationLevel === 0).length,
+        breached: items.filter((i) => i.sla.isBreached).length,
+        warning: items.filter((i) => i.sla.isWarning).length,
+        dueToday: items.filter((i) => i.sla.isDueToday).length,
+        normal: items.filter((i) => i.sla.escalationLevel === 0).length
       }
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 10. Get Grievances SLA Status
 app.get("/api/sla/grievances", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
-    const { data: grievances, error } = await supabase
-      .from("grievances")
-      .select("*")
-      .eq("company_id", companyId);
-
+    const companyId = req.authenticatedCompanyId;
+    const { data: grievances, error } = await supabase.from("grievances").select("*").eq("company_id", companyId);
     if (error) {
       return res.status(500).json({ error: `Failed to fetch grievances: ${error.message}` });
     }
-
-    const items = (grievances || []).map((gr: any) => {
+    const items = (grievances || []).map((gr) => {
       const sla = slaEngine.calculateSlaStatus(gr.created_at, gr.sla_days || 15, gr.status);
       return {
         ...gr,
         sla
       };
     });
-
     return res.json({
       success: true,
       grievances: items,
       summary: {
         total: items.length,
-        breached: items.filter((i: any) => i.sla.isBreached).length,
-        warning: items.filter((i: any) => i.sla.isWarning).length,
-        dueToday: items.filter((i: any) => i.sla.isDueToday).length,
-        normal: items.filter((i: any) => i.sla.escalationLevel === 0).length,
+        breached: items.filter((i) => i.sla.isBreached).length,
+        warning: items.filter((i) => i.sla.isWarning).length,
+        dueToday: items.filter((i) => i.sla.isDueToday).length,
+        normal: items.filter((i) => i.sla.escalationLevel === 0).length
       }
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 11. Comprehensive SLA & Escalations Summary
 app.get("/api/sla/summary", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = req.authenticatedCompanyId!;
-
+    const companyId = req.authenticatedCompanyId;
     const [appsRes, grievRes, escalationsRes] = await Promise.all([
       supabase.from("applications").select("id, status, sla_days, submitted_date, applied_date, created_at").eq("company_id", companyId),
       supabase.from("grievances").select("id, status, sla_days, created_at").eq("company_id", companyId),
       supabase.from("sla_escalations").select("*").eq("company_id", companyId).order("triggered_at", { ascending: false })
     ]);
-
     let appBreached = 0, appWarning = 0, appDueToday = 0;
-    (appsRes.data || []).forEach((app: any) => {
-      const start = app.submitted_date || app.applied_date || app.created_at;
-      const sla = slaEngine.calculateSlaStatus(start, app.sla_days, app.status);
+    (appsRes.data || []).forEach((app2) => {
+      const start = app2.submitted_date || app2.applied_date || app2.created_at;
+      const sla = slaEngine.calculateSlaStatus(start, app2.sla_days, app2.status);
       if (sla.isBreached) appBreached++;
       else if (sla.isDueToday) appDueToday++;
       else if (sla.isWarning) appWarning++;
     });
-
     let grievBreached = 0, grievWarning = 0, grievDueToday = 0;
-    (grievRes.data || []).forEach((gr: any) => {
+    (grievRes.data || []).forEach((gr) => {
       const sla = slaEngine.calculateSlaStatus(gr.created_at, gr.sla_days || 15, gr.status);
       if (sla.isBreached) grievBreached++;
       else if (sla.isDueToday) grievDueToday++;
       else if (sla.isWarning) grievWarning++;
     });
-
     return res.json({
       success: true,
       companyId,
@@ -6517,26 +6541,22 @@ app.get("/api/sla/summary", requireCompanyAuth, async (req, res) => {
         escalations: escalationsRes.data || []
       }
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 12. Administrative Trigger: Run SLA Monitoring Engine (Protected by requireRegulatoryAdmin)
 app.post("/api/admin/sla/process", requireRegulatoryAdmin, async (_req, res) => {
   try {
     const result = await slaEngine.processSlaMonitoring();
     return res.json({
       success: true,
-      timestamp: new Date().toISOString(),
+      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
       ...result
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: `SLA monitoring job execution failed: ${err.message}` });
   }
 });
-
-// 12b. Vercel Cron Job Trigger (GET /api/admin/sla/cron or /api/admin/sla/process)
 app.get("/api/admin/sla/cron", async (req, res) => {
   try {
     const cronSecret = process.env.CRON_SECRET;
@@ -6548,37 +6568,27 @@ app.get("/api/admin/sla/cron", async (req, res) => {
     return res.json({
       success: true,
       source: "vercel-cron",
-      timestamp: new Date().toISOString(),
+      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
       ...result
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: `SLA cron execution failed: ${err.message}` });
   }
 });
-
-// =========================================================================
-// STEP 12: DATABASE-DRIVEN DASHBOARD & ANALYTICS REST API ENDPOINTS
-// =========================================================================
-
-// 1. Company Dashboard Summary (Tenant isolated via req.authenticatedCompanyId)
-app.get("/api/dashboard/summary", requireCompanyAuth, async (req: Request, res: Response) => {
+app.get("/api/dashboard/summary", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = (req as any).authenticatedCompanyId;
+    const companyId = req.authenticatedCompanyId;
     const summary = await dashboardEngine.getCompanyDashboardSummary(companyId);
     return res.json(summary);
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 2. Company Dashboard Applications (Filtered, Tenant isolated)
-app.get("/api/dashboard/applications", requireCompanyAuth, async (req: Request, res: Response) => {
+app.get("/api/dashboard/applications", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = (req as any).authenticatedCompanyId;
+    const companyId = req.authenticatedCompanyId;
     const { status, department, category, search } = req.query;
-
     let query = supabase.from("applications").select("*").eq("company_id", companyId).order("created_at", { ascending: false });
-
     if (status && status !== "ALL") {
       query = query.eq("status", String(status));
     }
@@ -6588,22 +6598,16 @@ app.get("/api/dashboard/applications", requireCompanyAuth, async (req: Request, 
     if (category && category !== "ALL") {
       query = query.eq("category", String(category));
     }
-
     const { data: apps, error } = await query;
     if (error) throw error;
-
     let result = apps || [];
     if (search && String(search).trim() !== "") {
       const q = String(search).toLowerCase().trim();
-      result = result.filter(a =>
-        (a.name || "").toLowerCase().includes(q) ||
-        (a.code || "").toLowerCase().includes(q) ||
-        (a.department || "").toLowerCase().includes(q)
+      result = result.filter(
+        (a) => (a.name || "").toLowerCase().includes(q) || (a.code || "").toLowerCase().includes(q) || (a.department || "").toLowerCase().includes(q)
       );
     }
-
-    // Attach computed SLA status
-    const mapped = result.map((a: any) => {
+    const mapped = result.map((a) => {
       const start = a.submitted_date || a.applied_date || a.created_at;
       const sla = slaEngine.calculateSlaStatus(start, a.sla_days, a.status);
       return {
@@ -6611,21 +6615,16 @@ app.get("/api/dashboard/applications", requireCompanyAuth, async (req: Request, 
         slaStatus: sla
       };
     });
-
     return res.json({ applications: mapped, count: mapped.length });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 3. Company Dashboard Grievances (Filtered, Tenant isolated)
-app.get("/api/dashboard/grievances", requireCompanyAuth, async (req: Request, res: Response) => {
+app.get("/api/dashboard/grievances", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = (req as any).authenticatedCompanyId;
+    const companyId = req.authenticatedCompanyId;
     const { status, category, priority } = req.query;
-
     let query = supabase.from("grievances").select("*").eq("company_id", companyId).order("created_at", { ascending: false });
-
     if (status && status !== "ALL") {
       query = query.ilike("status", String(status));
     }
@@ -6635,24 +6634,18 @@ app.get("/api/dashboard/grievances", requireCompanyAuth, async (req: Request, re
     if (priority && priority !== "ALL") {
       query = query.ilike("priority", String(priority));
     }
-
     const { data: grievances, error } = await query;
     if (error) throw error;
-
     return res.json({ grievances: grievances || [], count: (grievances || []).length });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 4. Company Dashboard Documents (Filtered, Tenant isolated)
-app.get("/api/dashboard/documents", requireCompanyAuth, async (req: Request, res: Response) => {
+app.get("/api/dashboard/documents", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = (req as any).authenticatedCompanyId;
+    const companyId = req.authenticatedCompanyId;
     const { status, category, applicationId } = req.query;
-
     let query = supabase.from("documents").select("*").eq("company_id", companyId).order("created_at", { ascending: false });
-
     if (status && status !== "ALL") {
       query = query.ilike("status", String(status));
     }
@@ -6662,69 +6655,56 @@ app.get("/api/dashboard/documents", requireCompanyAuth, async (req: Request, res
     if (applicationId) {
       query = query.eq("application_id", String(applicationId));
     }
-
     const { data: documents, error } = await query;
     if (error) throw error;
-
     return res.json({ documents: documents || [], count: (documents || []).length });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 5. Company Dashboard Notifications (Tenant isolated)
-app.get("/api/dashboard/notifications", requireCompanyAuth, async (req: Request, res: Response) => {
+app.get("/api/dashboard/notifications", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = (req as any).authenticatedCompanyId;
+    const companyId = req.authenticatedCompanyId;
     const { unread, type } = req.query;
-
     let query = supabase.from("notifications").select("*").eq("company_id", companyId).order("created_at", { ascending: false });
-
     if (unread === "true" || unread === "1") {
       query = query.eq("is_read", false);
     }
     if (type && type !== "ALL") {
       query = query.ilike("type", `%${String(type)}%`);
     }
-
     const { data: notifications, error } = await query;
     if (error) throw error;
-
     return res.json({ notifications: notifications || [], count: (notifications || []).length });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 6. Company Dashboard SLA Monitoring Summary (Tenant isolated)
-app.get("/api/dashboard/sla", requireCompanyAuth, async (req: Request, res: Response) => {
+app.get("/api/dashboard/sla", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = (req as any).authenticatedCompanyId;
+    const companyId = req.authenticatedCompanyId;
     const [appsRes, grievRes, escalationsRes] = await Promise.all([
       supabase.from("applications").select("*").eq("company_id", companyId),
       supabase.from("grievances").select("*").eq("company_id", companyId),
       supabase.from("sla_escalations").select("*").eq("company_id", companyId).order("created_at", { ascending: false })
     ]);
-
     let appBreached = 0, appWarning = 0, appDueToday = 0, appOnTrack = 0;
-    (appsRes.data || []).forEach((app: any) => {
-      const start = app.submitted_date || app.applied_date || app.created_at;
-      const sla = slaEngine.calculateSlaStatus(start, app.sla_days, app.status);
+    (appsRes.data || []).forEach((app2) => {
+      const start = app2.submitted_date || app2.applied_date || app2.created_at;
+      const sla = slaEngine.calculateSlaStatus(start, app2.sla_days, app2.status);
       if (sla.isBreached) appBreached++;
       else if (sla.isWarning) appWarning++;
       else if (sla.isDueToday) appDueToday++;
       else appOnTrack++;
     });
-
     let grievBreached = 0, grievWarning = 0, grievDueToday = 0, grievOnTrack = 0;
-    (grievRes.data || []).forEach((g: any) => {
+    (grievRes.data || []).forEach((g) => {
       const sla = slaEngine.calculateSlaStatus(g.created_at, g.expected_sla_days || g.sla_days || 15, g.status);
       if (sla.isBreached) grievBreached++;
       else if (sla.isWarning) grievWarning++;
       else if (sla.isDueToday) grievDueToday++;
       else grievOnTrack++;
     });
-
     return res.json({
       companyId,
       applications: {
@@ -6743,41 +6723,34 @@ app.get("/api/dashboard/sla", requireCompanyAuth, async (req: Request, res: Resp
       },
       escalations: escalationsRes.data || []
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 7. Company Dashboard Investments (Tenant isolated)
-app.get("/api/dashboard/investments", requireCompanyAuth, async (req: Request, res: Response) => {
+app.get("/api/dashboard/investments", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = (req as any).authenticatedCompanyId;
+    const companyId = req.authenticatedCompanyId;
     const { data: plans, error } = await supabase.from("invest_plans").select("*").eq("company_id", companyId).order("created_at", { ascending: false });
     if (error) throw error;
-
     const totalProposedInvestmentCr = (plans || []).reduce((sum, p) => sum + (Number(p.investment_cr) || 0), 0);
-
     return res.json({
       plans: plans || [],
       totalPlans: (plans || []).length,
       totalProposedInvestmentCr
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 8. Company Dashboard CSV Data Export (Tenant isolated)
-app.get("/api/dashboard/export", requireCompanyAuth, async (req: Request, res: Response) => {
+app.get("/api/dashboard/export", requireCompanyAuth, async (req, res) => {
   try {
-    const companyId = (req as any).authenticatedCompanyId;
+    const companyId = req.authenticatedCompanyId;
     const format = String(req.query.format || "csv").toLowerCase();
     const type = String(req.query.type || "applications").toLowerCase();
-
     if (type === "applications") {
       const { data: apps } = await supabase.from("applications").select("*").eq("company_id", companyId);
       const headers = ["Application ID", "Code", "Name", "Department", "Category", "Status", "SLA Days", "Submitted Date"];
-      const rows = (apps || []).map(a => [
+      const rows = (apps || []).map((a) => [
         a.id,
         a.code || "",
         a.name || "",
@@ -6787,9 +6760,7 @@ app.get("/api/dashboard/export", requireCompanyAuth, async (req: Request, res: R
         a.sla_days || 0,
         a.submitted_date || a.created_at || ""
       ]);
-
       if (format === "json") return res.json({ applications: apps || [] });
-
       const csv = dashboardEngine.generateCsv(headers, rows);
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
       res.setHeader("Content-Disposition", `attachment; filename="company_applications_${companyId}.csv"`);
@@ -6797,7 +6768,7 @@ app.get("/api/dashboard/export", requireCompanyAuth, async (req: Request, res: R
     } else if (type === "grievances") {
       const { data: grievs } = await supabase.from("grievances").select("*").eq("company_id", companyId);
       const headers = ["Grievance ID", "Reference Number", "Subject", "Category", "Priority", "Status", "Created Date"];
-      const rows = (grievs || []).map(g => [
+      const rows = (grievs || []).map((g) => [
         g.id,
         g.reference_number || g.id || "",
         g.subject || "",
@@ -6806,9 +6777,7 @@ app.get("/api/dashboard/export", requireCompanyAuth, async (req: Request, res: R
         g.status || "",
         g.created_at || ""
       ]);
-
       if (format === "json") return res.json({ grievances: grievs || [] });
-
       const csv = dashboardEngine.generateCsv(headers, rows);
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
       res.setHeader("Content-Disposition", `attachment; filename="company_grievances_${companyId}.csv"`);
@@ -6816,47 +6785,35 @@ app.get("/api/dashboard/export", requireCompanyAuth, async (req: Request, res: R
     } else {
       return res.status(400).json({ error: `Unsupported export type: ${type}` });
     }
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// =========================================================================
-// ANALYTICS APIS (AUTHENTICATED, ZERO PII)
-// =========================================================================
-
-// 9. Department Analytics
-app.get("/api/analytics/departments", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/analytics/departments", requireCompanyAuth, async (_req, res) => {
   try {
     const data = await dashboardEngine.getDepartmentAnalytics();
     return res.json({ departments: data, count: data.length });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 10. District Analytics
-app.get("/api/analytics/districts", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/analytics/districts", requireCompanyAuth, async (_req, res) => {
   try {
     const data = await dashboardEngine.getDistrictAnalytics();
     return res.json({ districts: data, count: data.length });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 11. Sector Analytics
-app.get("/api/analytics/sectors", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/analytics/sectors", requireCompanyAuth, async (_req, res) => {
   try {
     const data = await dashboardEngine.getSectorAnalytics();
     return res.json({ sectors: data, count: data.length });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 12. SLA Analytics Aggregation
-app.get("/api/analytics/sla", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/analytics/sla", requireCompanyAuth, async (_req, res) => {
   try {
     const summary = await dashboardEngine.getPublicDashboardSummary();
     const depts = await dashboardEngine.getDepartmentAnalytics();
@@ -6866,7 +6823,7 @@ app.get("/api/analytics/sla", requireCompanyAuth, async (_req: Request, res: Res
         avgProcessingDays: summary.overview.avgProcessingDays,
         totalApplications: summary.overview.totalApplications
       },
-      departmentCompliance: depts.map(d => ({
+      departmentCompliance: depts.map((d) => ({
         name: d.name,
         code: d.code,
         slaComplianceRate: d.slaComplianceRate,
@@ -6874,40 +6831,32 @@ app.get("/api/analytics/sla", requireCompanyAuth, async (_req: Request, res: Res
         applicationsCount: d.applicationsCount
       }))
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 13. Grievance Analytics
-app.get("/api/analytics/grievances", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/analytics/grievances", requireCompanyAuth, async (_req, res) => {
   try {
     const data = await dashboardEngine.getGrievanceAnalytics();
     return res.json(data);
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 14. Document Analytics
-app.get("/api/analytics/documents", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/analytics/documents", requireCompanyAuth, async (_req, res) => {
   try {
     const { data: docs, error } = await supabase.from("documents").select("id, status, category, updated_at");
     if (error) throw error;
-
     let verified = 0, pending = 0, rejected = 0;
-    const typeDistribution: Record<string, number> = {};
-
-    (docs || []).forEach(d => {
+    const typeDistribution = {};
+    (docs || []).forEach((d) => {
       const st = (d.status || "").toLowerCase();
       if (st === "verified") verified++;
       else if (st === "rejected") rejected++;
       else pending++;
-
       const t = d.category || "General";
       typeDistribution[t] = (typeDistribution[t] || 0) + 1;
     });
-
     return res.json({
       total: (docs || []).length,
       verified,
@@ -6916,54 +6865,42 @@ app.get("/api/analytics/documents", requireCompanyAuth, async (_req: Request, re
       expired: 0,
       typeDistribution
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 15. Investment Analytics
-app.get("/api/analytics/investment", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/analytics/investment", requireCompanyAuth, async (_req, res) => {
   try {
     const [companiesRes, investRes] = await Promise.all([
       supabase.from("companies").select("id, investment_crores, sector, district"),
       supabase.from("invest_plans").select("id, investment_cr, industry_sector, location")
     ]);
-
     const totalEnterpriseInvestmentCr = (companiesRes.data || []).reduce((sum, c) => sum + (Number(c.investment_crores) || 0), 0);
     const totalPipelineInvestmentCr = (investRes.data || []).reduce((sum, p) => sum + (Number(p.investment_cr) || 0), 0);
-
     return res.json({
       totalEnterprises: companiesRes.data?.length || 0,
       totalInvestmentPlans: investRes.data?.length || 0,
       totalEnterpriseInvestmentCr: Math.round(totalEnterpriseInvestmentCr * 100) / 100,
       totalPipelineInvestmentCr: Math.round(totalPipelineInvestmentCr * 100) / 100
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// =========================================================================
-// PUBLIC DASHBOARD APIS (ZERO PII, AGGREGATE ONLY)
-// =========================================================================
-
-// 16. Public Dashboard Summary (Zero PII)
-app.get("/api/public-dashboard/summary", requireCompanyAuth, async (req: Request, res: Response) => {
+app.get("/api/public-dashboard/summary", requireCompanyAuth, async (req, res) => {
   try {
     const { year, month, department } = req.query;
     const summary = await dashboardEngine.getPublicDashboardSummary({
-      year: year ? String(year) : undefined,
-      month: month ? String(month) : undefined,
-      department: department ? String(department) : undefined
+      year: year ? String(year) : void 0,
+      month: month ? String(month) : void 0,
+      department: department ? String(department) : void 0
     });
     return res.json(summary);
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 17. Public Dashboard Applications Breakdown (Zero PII)
-app.get("/api/public-dashboard/applications", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/public-dashboard/applications", requireCompanyAuth, async (_req, res) => {
   try {
     const summary = await dashboardEngine.getPublicDashboardSummary();
     const depts = await dashboardEngine.getDepartmentAnalytics();
@@ -6971,53 +6908,43 @@ app.get("/api/public-dashboard/applications", requireCompanyAuth, async (_req: R
       overview: summary.overview,
       byDepartment: depts
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 18. Public Dashboard Departments (Zero PII)
-app.get("/api/public-dashboard/departments", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/public-dashboard/departments", requireCompanyAuth, async (_req, res) => {
   try {
     const depts = await dashboardEngine.getDepartmentAnalytics();
     return res.json({ departments: depts, count: depts.length });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 19. Public Dashboard Districts (Zero PII)
-app.get("/api/public-dashboard/districts", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/public-dashboard/districts", requireCompanyAuth, async (_req, res) => {
   try {
     const districts = await dashboardEngine.getDistrictAnalytics();
     return res.json({ districts, count: districts.length });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 20. Public Dashboard Sectors (Zero PII)
-app.get("/api/public-dashboard/sectors", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/public-dashboard/sectors", requireCompanyAuth, async (_req, res) => {
   try {
     const sectors = await dashboardEngine.getSectorAnalytics();
     return res.json({ sectors, count: sectors.length });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 21. Public Dashboard Grievances (Zero PII)
-app.get("/api/public-dashboard/grievances", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/public-dashboard/grievances", requireCompanyAuth, async (_req, res) => {
   try {
     const grievances = await dashboardEngine.getGrievanceAnalytics();
     return res.json(grievances);
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 22. Public Dashboard SLA (Zero PII)
-app.get("/api/public-dashboard/sla", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/public-dashboard/sla", requireCompanyAuth, async (_req, res) => {
   try {
     const summary = await dashboardEngine.getPublicDashboardSummary();
     const depts = await dashboardEngine.getDepartmentAnalytics();
@@ -7027,45 +6954,37 @@ app.get("/api/public-dashboard/sla", requireCompanyAuth, async (_req: Request, r
       overduePercentage: summary.overview.overduePercentage,
       departmentCompliance: depts
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 23. Public Dashboard Investment (Zero PII)
-app.get("/api/public-dashboard/investment", requireCompanyAuth, async (_req: Request, res: Response) => {
+app.get("/api/public-dashboard/investment", requireCompanyAuth, async (_req, res) => {
   try {
     const [companiesRes, investRes] = await Promise.all([
       supabase.from("companies").select("id, investment_crores"),
       supabase.from("invest_plans").select("id, investment_cr")
     ]);
-
     const totalEnterpriseCr = (companiesRes.data || []).reduce((sum, c) => sum + (Number(c.investment_crores) || 0), 0);
     const totalPipelineCr = (investRes.data || []).reduce((sum, p) => sum + (Number(p.investment_cr) || 0), 0);
-
     return res.json({
       totalEnterprises: (companiesRes.data || []).length,
       totalProposedInvestmentCr: Math.round((totalEnterpriseCr + totalPipelineCr) * 100) / 100,
       registeredInvestmentCr: Math.round(totalEnterpriseCr * 100) / 100,
       pipelineInvestmentCr: Math.round(totalPipelineCr * 100) / 100
     });
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// 24. Public Dashboard CSV Export (Zero PII)
-app.get("/api/public-dashboard/export", requireCompanyAuth, async (req: Request, res: Response) => {
+app.get("/api/public-dashboard/export", requireCompanyAuth, async (req, res) => {
   try {
     const type = String(req.query.type || "departments").toLowerCase();
     const format = String(req.query.format || "csv").toLowerCase();
-
     if (type === "departments") {
       const depts = await dashboardEngine.getDepartmentAnalytics();
       if (format === "json") return res.json({ departments: depts });
-
       const headers = ["Department Name", "Code", "Total Applications", "Approved", "Rejected", "Pending", "Avg Processing Days", "SLA Compliance Rate (%)"];
-      const rows = depts.map(d => [d.name, d.code, d.applicationsCount, d.approvedCount, d.rejectedCount, d.pendingCount, d.avgProcessingDays, d.slaComplianceRate]);
+      const rows = depts.map((d) => [d.name, d.code, d.applicationsCount, d.approvedCount, d.rejectedCount, d.pendingCount, d.avgProcessingDays, d.slaComplianceRate]);
       const csv = dashboardEngine.generateCsv(headers, rows);
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
       res.setHeader("Content-Disposition", 'attachment; filename="public_department_analytics.csv"');
@@ -7073,9 +6992,8 @@ app.get("/api/public-dashboard/export", requireCompanyAuth, async (req: Request,
     } else if (type === "districts") {
       const districts = await dashboardEngine.getDistrictAnalytics();
       if (format === "json") return res.json({ districts });
-
       const headers = ["District", "Units Count", "Applications Count", "Approved", "Pending", "Proposed Investment (Cr)", "Top Sectors"];
-      const rows = districts.map(d => [d.district, d.unitsCount, d.applicationsCount, d.approvedCount, d.pendingCount, d.proposedInvestmentCr, d.topSectors.join("; ")]);
+      const rows = districts.map((d) => [d.district, d.unitsCount, d.applicationsCount, d.approvedCount, d.pendingCount, d.proposedInvestmentCr, d.topSectors.join("; ")]);
       const csv = dashboardEngine.generateCsv(headers, rows);
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
       res.setHeader("Content-Disposition", 'attachment; filename="public_district_analytics.csv"');
@@ -7083,9 +7001,8 @@ app.get("/api/public-dashboard/export", requireCompanyAuth, async (req: Request,
     } else if (type === "sectors") {
       const sectors = await dashboardEngine.getSectorAnalytics();
       if (format === "json") return res.json({ sectors });
-
       const headers = ["Sector", "Enterprises Count", "Applications Count", "Approved", "Pending", "Proposed Investment (Cr)", "Share Percent (%)"];
-      const rows = sectors.map(s => [s.sector, s.enterprisesCount, s.applicationsCount, s.approvedCount, s.pendingCount, s.proposedInvestmentCr, s.sharePercent]);
+      const rows = sectors.map((s) => [s.sector, s.enterprisesCount, s.applicationsCount, s.approvedCount, s.pendingCount, s.proposedInvestmentCr, s.sharePercent]);
       const csv = dashboardEngine.generateCsv(headers, rows);
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
       res.setHeader("Content-Disposition", 'attachment; filename="public_sector_analytics.csv"');
@@ -7093,55 +7010,42 @@ app.get("/api/public-dashboard/export", requireCompanyAuth, async (req: Request,
     } else {
       return res.status(400).json({ error: `Unsupported public export type: ${type}` });
     }
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// =========================================================================
-// CENTRALIZED SAFE API ERROR & 404 HANDLER (Step 13 Hardening)
-// =========================================================================
-
-// Handle unmatched API routes with clean JSON 404
-app.all(["/api", "/api/*"], (_req: Request, res: Response) => {
+app.all(["/api", "/api/*"], (_req, res) => {
   return res.status(404).json({
     error: "API endpoint not found."
   });
 });
-
-// Centralized error handling middleware
-app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+app.use((err, _req, res, _next) => {
   const statusCode = err.status || err.statusCode || 500;
-  // Log full error on server side for observability
   console.error(`[Server Error ${statusCode}]:`, err);
-
-  // Sanitize client-facing error message (never leak passwords, keys, or stack traces)
   let safeMessage = "An unexpected error occurred. Please try again later.";
   if (err.message && typeof err.message === "string") {
-    // Only pass through safe validation or business logic messages
     if (!err.message.includes("at ") && !err.message.includes("node_modules") && !err.message.includes("SUPABASE")) {
       safeMessage = err.message;
     }
   }
-
   return res.status(statusCode).json({
     error: safeMessage
   });
 });
-
-// Vite Middleware or Static Serving (Local development only - bypassed on Vercel)
-export async function setupVite() {
-  const isVercel = !!process.env.VERCEL || !!process.env.VERCEL_ENV || !!process.env.NOW_REGION;
-  if (isVercel) {
+async function setupVite() {
+  const isVercel2 = !!process.env.VERCEL || !!process.env.VERCEL_ENV || !!process.env.NOW_REGION;
+  if (isVercel2) {
     return;
   }
-
   if (process.env.NODE_ENV !== "production") {
     const vitePkg = "vite";
-    const { createServer: createViteServer } = await import(/* @vite-ignore */ vitePkg);
+    const { createServer: createViteServer } = await import(
+      /* @vite-ignore */
+      vitePkg
+    );
     const vite = await createViteServer({
       server: { middlewareMode: true, allowedHosts: true },
-      appType: "spa",
+      appType: "spa"
     });
     app.use(vite.middlewares);
   } else {
@@ -7151,22 +7055,57 @@ export async function setupVite() {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
-
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`MahaUdyogSetu Server running on http://0.0.0.0:${PORT}`);
   });
 }
-
-const isVercel = !!process.env.VERCEL || !!process.env.VERCEL_ENV || !!process.env.NOW_REGION;
-const isMain = !isVercel && Boolean(process.argv && process.argv[1]) && (
-  process.argv[1].endsWith("server.ts") || 
-  process.argv[1].endsWith("server.cjs") || 
-  (process.argv[1].endsWith("server.js") && !process.argv[1].includes(".vercel") && !process.argv[1].includes("/var/task"))
-);
+var isVercel = !!process.env.VERCEL || !!process.env.VERCEL_ENV || !!process.env.NOW_REGION;
+var isMain = !isVercel && Boolean(process.argv && process.argv[1]) && (process.argv[1].endsWith("server.ts") || process.argv[1].endsWith("server.cjs") || process.argv[1].endsWith("server.js") && !process.argv[1].includes(".vercel") && !process.argv[1].includes("/var/task"));
 if (isMain && process.env.NODE_ENV !== "test") {
   setupVite().catch((err) => {
     console.error("Failed to start server:", err);
   });
 }
-
-export default app;
+var server_default = app;
+export {
+  ALLOWED_FEEDBACK_MODULES,
+  ALLOWED_FEEDBACK_TYPES,
+  ALLOWED_GRIEVANCE_CATEGORIES,
+  ALLOWED_GRIEVANCE_PRIORITIES,
+  BENCHMARK_SEED_APPROVALS,
+  BENCHMARK_SEED_FEEDBACK,
+  BENCHMARK_SEED_GRIEVANCES,
+  BENCHMARK_SEED_INVEST_PLAN,
+  app,
+  approvalItemToDb,
+  createRateLimiter,
+  createRegulatoryVersion,
+  dbToApprovalItem,
+  dbToBusinessProfile,
+  dbToDocumentItem,
+  dbToFeedbackRecord,
+  dbToGrievanceRecord,
+  dbToInvestPlan,
+  server_default as default,
+  documentItemToDb,
+  evaluateApprovalRules,
+  generateSessionToken,
+  grievanceRecordToDb,
+  hashPassword,
+  isValidGSTIN,
+  isValidMobile,
+  isValidPAN,
+  logRegulatoryAudit,
+  registeredCompaniesMap,
+  requireCompanyAuth,
+  requireRegulatoryAdmin,
+  sanitizeFilename,
+  seedDefaultApplicationsIfEmpty,
+  seedDefaultFeedbackIfEmpty,
+  seedDefaultGrievancesIfEmpty,
+  seedDefaultInvestPlanIfEmpty,
+  setupVite,
+  validateDocumentFile,
+  verifyPassword,
+  verifySessionToken
+};
